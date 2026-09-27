@@ -92,6 +92,60 @@ def test_record_replay_source_headless(tmp_path):
     assert ts == sorted(ts)
 
 
+def test_toggle_session_records_one_take_per_start_stop(tmp_path):
+    # standby 0-0.5 s, take 1 0.5-1.5 s, standby, take 2 2.0-3.0 s, then quit from standby.
+    rt.main([
+        "--operator", "op00", "--scenario", "selftest", "--source", "replay:correct",
+        "--fps", "15", "--no-preview", "--out", str(tmp_path), "--toggle",
+        "--script", "0.5:r,0.9:1,1.5:r,2.0:r,2.4:2,3.0:r,3.3:q",
+    ])  # fmt: skip
+    assert sorted(p.name for p in tmp_path.glob("*.mp4")) == [
+        "op00_selftest_01.mp4",
+        "op00_selftest_02.mp4",
+    ]
+    for n, step in ((1, "S1"), (2, "S2")):
+        stem = tmp_path / f"op00_selftest_{n:02d}"
+        meta = json.loads(stem.with_suffix(".json").read_text(encoding="utf-8"))
+        assert meta["stop_reason"] == "toggle"
+        assert 10 <= meta["frames"] <= 20  # ~1 s at 15 fps; standby time is not recorded
+        assert meta["cameras"][0]["frame_count_ok"]
+        assert _decoded_frames(stem.with_suffix(".mp4")) == meta["frames"]
+        frames = _rows(tmp_path / f"op00_selftest_{n:02d}.frames.csv")
+        assert [int(r["frame_idx"]) for r in frames] == list(range(meta["frames"]))
+        assert [r["label"] for r in _rows(stem.with_suffix(".csv"))] == ["idle", step]
+
+
+def test_toggle_session_quit_without_recording(tmp_path):
+    rt.main([
+        "--operator", "op00", "--scenario", "selftest", "--source", "replay:correct",
+        "--fps", "15", "--no-preview", "--out", str(tmp_path), "--toggle", "--script", "0.3:q",
+    ])  # fmt: skip
+    assert list(tmp_path.glob("*.mp4")) == []
+
+
+def test_label_pending_labels_only_unlabelled_takes(tmp_path):
+    # take 01: no keys pressed while recording (pending); take 02: labelled live (not pending);
+    # take 03 has a second camera whose file must not be offered separately.
+    rt.main([
+        "--operator", "op00", "--scenario", "selftest", "--source", "replay:correct",
+        "--fps", "15", "--no-preview", "--out", str(tmp_path), "--toggle",
+        "--script", "0.3:r,1.3:r,1.6:r,2.0:1,2.6:r,2.9:r,3.9:r,4.2:q",
+        "--source2", "replay:correct",
+    ])  # fmt: skip
+    assert [p.name for p in rt.pending_takes(tmp_path)] == [
+        "op00_selftest_01.mp4",
+        "op00_selftest_03.mp4",
+    ]
+    rt.main(["--label-pending", str(tmp_path), "--no-preview", "--script", "0.4:3"])
+    for n in (1, 3):
+        stem = tmp_path / f"op00_selftest_{n:02d}"
+        assert [r["label"] for r in _rows(stem.with_suffix(".csv"))] == ["idle", "S3"]
+        assert "labelled_at" in json.loads(stem.with_suffix(".json").read_text(encoding="utf-8"))
+    labels_02 = _rows(tmp_path / "op00_selftest_02.csv")
+    assert [r["label"] for r in labels_02] == ["idle", "S1"]  # untouched
+    assert rt.pending_takes(tmp_path) == []
+
+
 def test_playback_labelling(tmp_path):
     # make a short file first, then label it in playback mode (no window)
     rt.main([

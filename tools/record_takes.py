@@ -6,18 +6,33 @@ Record (webcam, optional second camera / phone RTSP feed):
     uv run python tools/record_takes.py --operator op02 --scenario skip_S2 --source 1 \\
         --source2 rtsp://192.168.1.50:8554/live --roll 90 --lighting dim --notes "lid sticky"
 
+Toggle mode: the camera opens in a live standby preview; ``r`` starts a take, ``r`` stops and
+saves it, and the next ``r`` starts the next take number. ``q`` ends the session.
+
+    uv run python tools/record_takes.py --operator op01 --scenario correct --toggle
+
 Label a file already recorded (e.g. shot with a phone camera app):
 
     uv run python tools/record_takes.py --label data/raw/op03_correct_02.mp4
+
+Label every take that has no labels yet, one after another (``q`` saves and opens the next,
+``Esc`` saves and stops the batch):
+
+    uv run python tools/record_takes.py --label-pending            # data/raw
+    uv run python tools/record_takes.py --label-pending data/other_dir
 
 Keys (both modes)
 -----------------
     1–9     step S1–S9 starts at this frame         0   idle (no step in progress)
     x       a non-step action starts ("other")      u   undo the last label
     q / Esc finish and save
+  toggle mode only:
+    r       start a take (standby) / stop and save it (recording)
   playback only:
     space   pause / resume      .  ,   step one frame forward / back (while paused)
     s       cycle speed 1× → 0.5× → 0.25×          ]  [   jump 5 s forward / back
+  --label-pending only:
+    q       save and open the next pending take     Esc save and stop the batch
 
 Step-boundary rule: press the key on the frame where the operator's hand starts moving toward
 the object for that step, and `0` once the step's end state is reached and the hand withdraws.
@@ -73,6 +88,10 @@ STEM_RE = re.compile(
 SPEEDS = (1.0, 0.5, 0.25)
 GRACE = 0.4  # fraction of a frame period to wait for a late camera frame
 KEY_HELP = "1-9 step  0 idle  x other  u undo  q quit"
+TOGGLE_HELP_STANDBY = "r start recording  q quit"
+TOGGLE_HELP_RECORDING = "1-9 step  0 idle  x other  u undo  r stop take  q stop+quit"
+BATCH_HELP = "1-9 step  0 idle  x other  u undo  q save+next  Esc save+stop"
+WINDOW = "ACTUS take recorder"
 
 
 # --------------------------------------------------------------------------------------------
@@ -381,7 +400,14 @@ def _put(img, text, org, scale=0.6, color=(255, 255, 255), thick=1):
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
 
 
-def overlay(img: np.ndarray, lines: list[str], label: str, rec: bool, max_w: int = 960):
+def overlay(
+    img: np.ndarray,
+    lines: list[str],
+    label: str,
+    rec: bool,
+    max_w: int = 960,
+    help_text: str = KEY_HELP,
+):
     scale = min(1.0, max_w / img.shape[1])
     view = cv2.resize(img, None, fx=scale, fy=scale) if scale < 1 else img.copy()
     h, w = view.shape[:2]
@@ -393,7 +419,7 @@ def overlay(img: np.ndarray, lines: list[str], label: str, rec: bool, max_w: int
         y += 24
     color = (80, 220, 80) if label.startswith("S") else (200, 200, 200)
     _put(view, label.upper(), (w - 150, 44), 1.3, color, 3)
-    _put(view, KEY_HELP, (12, h - 12), 0.5, (220, 220, 220))
+    _put(view, help_text, (12, h - 12), 0.5, (220, 220, 220))
     return view
 
 
@@ -431,14 +457,8 @@ def parse_script(spec: str | None) -> list[tuple[float, str]]:
     return sorted(out)
 
 
-def record(args) -> Path:
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    n = args.n or next_take_number(out_dir, args.operator, args.scenario)
-    stem = take_stem(args.operator, args.scenario, n)
-    if (out_dir / f"{stem}.mp4").exists() and not args.force:
-        raise SystemExit(f"{out_dir / stem}.mp4 exists; pass --force or another --n")
-
+def open_sources(args) -> list:
+    """Open --source (and --source2), start their threads and wait for a first frame."""
     sources = [open_source(args.source, args)]
     if args.source2:
         sources.append(open_source(args.source2, args))
@@ -451,28 +471,124 @@ def record(args) -> Path:
                 s.stop()
             raise SystemExit("no frames from the video source(s); check --source / --source2")
         time.sleep(0.01)
+    return sources
 
+
+def record(args) -> Path:
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n = args.n or next_take_number(out_dir, args.operator, args.scenario)
+    stem = take_stem(args.operator, args.scenario, n)
+    if (out_dir / f"{stem}.mp4").exists() and not args.force:
+        raise SystemExit(f"{out_dir / stem}.mp4 exists; pass --force or another --n")
+
+    sources = open_sources(args)
+    try:
+        meta_path, _ = record_take(args, sources, out_dir, n, parse_script(args.script))
+    finally:
+        for s in sources:
+            s.stop()
+        if not args.no_preview:
+            cv2.destroyAllWindows()
+    return meta_path
+
+
+def record_session(args) -> list[Path]:
+    """``--toggle``: the camera stays live in a standby preview; ``r`` starts a take and ``r``
+    again stops and saves it. Each start/stop is one take with the next free number."""
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    take_stem(args.operator, args.scenario, 1)  # validate the names before opening cameras
+    sources = open_sources(args)
+    script = parse_script(args.script)
+    preview = not args.no_preview
+    t_session = time.monotonic()
+    saved: list[Path] = []
+    first_n = args.n
+    print(f"standby: r = start/stop a take, q = quit  (operator {args.operator}, "
+          f"scenario {args.scenario}) -> {out_dir}")  # fmt: skip
+    try:
+        while not any(s.eof for s in sources):
+            n = first_n or next_take_number(out_dir, args.operator, args.scenario)
+            stem = take_stem(args.operator, args.scenario, n)
+            keys: list[int] = []
+            elapsed = time.monotonic() - t_session
+            while script and script[0][0] <= elapsed:
+                keys.append(ord(script.pop(0)[1][0]))
+            if preview:
+                latest = sources[0].latest()
+                if latest is not None:
+                    lines = [f"STANDBY  next take: {stem}", "press r to start recording"]
+                    view = overlay(latest[1], lines, "ready", False, help_text=TOGGLE_HELP_STANDBY)
+                    cv2.imshow(WINDOW, view)
+                keys.append(cv2.waitKey(1))
+            else:
+                time.sleep(1 / args.fps)
+            if any(k in (ord("q"), 27) for k in keys):
+                break
+            if ord("r") not in keys:
+                continue
+            first_n = None
+            if (out_dir / f"{stem}.mp4").exists() and not args.force:
+                print(f"{out_dir / stem}.mp4 exists; pass --force or another --n")
+                continue
+            meta_path, quit_session = record_take(
+                args, sources, out_dir, n, script, script_t0=t_session, toggle=True
+            )
+            saved.append(meta_path)
+            if quit_session:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for s in sources:
+            s.stop()
+        if preview:
+            cv2.destroyAllWindows()
+    print(f"session done: {len(saved)} take(s) saved")
+    for p in saved:
+        print(f"  {p.with_suffix('.mp4')}")
+    return saved
+
+
+def record_take(
+    args,
+    sources: list,
+    out_dir: Path,
+    n: int,
+    script: list[tuple[float, str]],
+    script_t0: float | None = None,
+    toggle: bool = False,
+) -> tuple[Path, bool]:
+    """Record one take from already-running sources. Returns (metadata path, quit requested).
+
+    ``script`` times are seconds since ``script_t0`` (default: the take's start). In toggle mode
+    ``r`` ends the take and returns to standby; ``q`` / Esc also ends the session."""
+    stem = take_stem(args.operator, args.scenario, n)
     cams = [CamRecorder(sources[0], out_dir / stem, args.fps, args.codec)]
     if len(sources) > 1:
         cams.append(CamRecorder(sources[1], out_dir / f"{stem}_cam2", args.fps, args.codec))
 
     labels_path = out_dir / f"{stem}.csv"
     track = LabelTrack()
-    script = parse_script(args.script)
-    window = "ACTUS take recorder"
     preview = not args.no_preview
+    help_text = TOGGLE_HELP_RECORDING if toggle else KEY_HELP
     wall_start = dt.datetime.now().astimezone()
     t0 = time.monotonic()
+    clock0 = t0 if script_t0 is None else script_t0
     frame_idx = -1
     last_t = 0.0
     stop_reason = "key"
-    print(f"recording {stem} at {args.fps:g} fps -> {out_dir}  (q to stop)")
+    quit_requested = True
+    stop_hint = "r to stop, q to stop and quit" if toggle else "q to stop"
+    print(f"recording {stem} at {args.fps:g} fps -> {out_dir}  ({stop_hint})")
 
     try:
         while True:
             elapsed = time.monotonic() - t0
             if args.duration and elapsed >= args.duration:
                 stop_reason = "duration"
+                quit_requested = not toggle
                 break
             if any(s.eof for s in sources):
                 stop_reason = "source_ended"
@@ -496,7 +612,8 @@ def record(args) -> Path:
                     img = written if cam is cams[0] else img
 
             keys: list[int] = []
-            while script and script[0][0] <= elapsed:
+            script_elapsed = time.monotonic() - clock0
+            while script and script[0][0] <= script_elapsed:
                 keys.append(ord(script.pop(0)[1][0]))
             if preview:
                 if img is not None:
@@ -504,13 +621,18 @@ def record(args) -> Path:
                         f"{stem}  f{frame_idx}  {elapsed:6.1f}s",
                         f"roll {args.roll}  light {args.lighting}  dup {cams[0].dups}",
                     ]
-                    cv2.imshow(window, overlay(img, lines, track.label_at(frame_idx), True))
+                    view = overlay(img, lines, track.label_at(frame_idx), True, help_text=help_text)
+                    cv2.imshow(WINDOW, view)
                 keys.append(cv2.waitKey(1))
             else:
                 next_tick = t0 + (frame_idx + 1) / args.fps
                 time.sleep(0.002 if waiting else max(0.0, next_tick - time.monotonic()))
 
             if any(k in (ord("q"), 27) for k in keys):
+                break
+            if toggle and ord("r") in keys:
+                stop_reason = "toggle"
+                quit_requested = False
                 break
             for key in keys:
                 if key in (ord("u"), 8):
@@ -524,12 +646,8 @@ def record(args) -> Path:
     except KeyboardInterrupt:
         stop_reason = "interrupted"
     finally:
-        for s in sources:
-            s.stop()
         for cam in cams:
             cam.close()
-        if preview:
-            cv2.destroyAllWindows()
     track.save(labels_path)
 
     duration = (frame_idx + 1) / args.fps
@@ -576,7 +694,7 @@ def record(args) -> Path:
     ok = all(c["frame_count_ok"] for c in meta["cameras"])
     print(f"saved {stem}: {frame_idx + 1} frames, {duration:.1f}s, "
           f"{len(track.items())} label rows, frame count {'OK' if ok else 'MISMATCH'}")  # fmt: skip
-    return meta_path
+    return meta_path, quit_requested
 
 
 # --------------------------------------------------------------------------------------------
@@ -632,8 +750,63 @@ class _Player:
             self.ring, self.ri = [keep], 0
 
 
+def is_pending(video: Path) -> bool:
+    """A take still needs labelling if it was never labelled in playback and its CSV holds no
+    label other than the initial ``idle`` row (i.e. nobody pressed step keys while recording)."""
+    meta_path = video.with_suffix(".json")
+    if meta_path.exists() and "labelled_at" in json.loads(meta_path.read_text(encoding="utf-8")):
+        return False
+    labels_path = video.with_suffix(".csv")
+    if not labels_path.exists():
+        return True
+    return all(lab == IDLE for _, _, lab in LabelTrack.load(labels_path).items())
+
+
+def pending_takes(folder: Path) -> list[Path]:
+    """Camera-1 takes in ``folder`` that still need labels (cam 2 shares cam 1's labels)."""
+    out = []
+    for video in sorted(folder.glob("*.mp4")):
+        try:
+            if parse_take_stem(video.stem)["cam"] != 1:
+                continue
+        except ValueError:
+            pass  # not our naming (e.g. a phone file): still labellable
+        if is_pending(video):
+            out.append(video)
+    return out
+
+
+def label_pending(args) -> list[Path]:
+    folder = Path(args.label_pending)
+    if not folder.is_dir():
+        raise SystemExit(f"{folder} is not a folder")
+    todo = pending_takes(folder)
+    if not todo:
+        print(f"nothing to label in {folder}")
+        return []
+    print(f"{len(todo)} take(s) to label in {folder}  (q = save + next, Esc = save + stop)")
+    done = []
+    for i, video in enumerate(todo, 1):
+        print(f"[{i}/{len(todo)}] {video.name}")
+        labels_path, stop = label_video(
+            args, video, progress=f"take {i}/{len(todo)}", help_text=BATCH_HELP
+        )
+        done.append(labels_path)
+        if stop:
+            print(f"stopped; {len(todo) - i} take(s) still pending")
+            break
+    return done
+
+
 def label_existing(args) -> Path:
-    video = Path(args.label)
+    labels_path, _ = label_video(args, Path(args.label))
+    return labels_path
+
+
+def label_video(
+    args, video: Path, progress: str = "", help_text: str = KEY_HELP
+) -> tuple[Path, bool]:
+    """Play ``video`` and label it. Returns (labels CSV path, Esc pressed)."""
     if not video.exists():
         raise SystemExit(f"{video} not found")
     labels_path = video.with_suffix(".csv")
@@ -655,6 +828,7 @@ def label_existing(args) -> Path:
         raise SystemExit(f"{video}: no decodable frames")
 
     paused, speed_i = False, 0
+    esc = False
     next_due = time.monotonic() + 1.0 / fps
     while True:
         # Without a window there is nothing to pace for: run through the file (tests, dry runs).
@@ -672,12 +846,17 @@ def label_existing(args) -> Path:
         if preview:
             state = f"  {SPEEDS[speed_i]:g}x" + ("  PAUSED" if paused else "")
             lines = [f"f{pos}/{total}  {t:7.2f}s{state}", "space pause  . , step  [ ] 5s  s speed"]
-            view = overlay(img, lines, track.label_at(pos), False)
+            if progress:
+                lines.insert(0, f"{progress}  {video.name}")
+            view = overlay(
+                img, lines, track.label_at(pos), False, max_w=args.view_width, help_text=help_text
+            )
             timeline_bar(view, track, pos, total)
             cv2.imshow(window, view)
             keys.append(cv2.waitKey(1 if not paused else 30))
 
         if any(k in (ord("q"), 27) for k in keys):
+            esc = 27 in keys
             break
         for key in keys:
             if key == ord(" "):
@@ -723,7 +902,7 @@ def label_existing(args) -> Path:
     meta["labelled_with"] = {"tool": "record_takes --label", "tool_version": TOOL_VERSION}
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"saved {labels_path.name}: {len(track.items())} label rows")
-    return labels_path
+    return labels_path, esc
 
 
 # --------------------------------------------------------------------------------------------
@@ -738,6 +917,16 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Keys: 1-9 step starts, 0 idle, x other, u undo, q quit. See the module docstring.",
     )
     ap.add_argument("--label", metavar="VIDEO", help="playback mode: label an existing file")
+    ap.add_argument(
+        "--label-pending",
+        metavar="DIR",
+        nargs="?",
+        const="data/raw",
+        help="label every take in DIR (default data/raw) that has no labels yet, one by one",
+    )
+    ap.add_argument(
+        "--view-width", type=int, default=640, help="playback: labeller window width (default 640)"
+    )
     ap.add_argument("--operator", help="operator id, e.g. op01 (no underscores)")
     ap.add_argument("--scenario", help="scenario name, e.g. correct, skip_S2, sweep, distractor")
     ap.add_argument("--n", type=int, help="take number (default: next free)")
@@ -754,7 +943,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--roll", type=int, default=0, help="camera roll angle, degrees")
     ap.add_argument("--lighting", default="normal", help="e.g. normal, dim, bright, mixed")
     ap.add_argument("--notes", default="", help="free text for the session metadata")
-    ap.add_argument("--duration", type=float, help="stop after this many seconds")
+    ap.add_argument("--duration", type=float, help="stop after this many seconds (per take)")
+    ap.add_argument(
+        "--toggle",
+        action="store_true",
+        help="start in a live standby preview; r starts/stops each take (one file per take)",
+    )
     ap.add_argument("--no-preview", action="store_true", help="no window (headless / tests)")
     ap.add_argument("--script", help='scripted keys "t:key,...", t = seconds (tests, dry runs)')
     ap.add_argument("--force", action="store_true", help="overwrite / ignore existing outputs")
@@ -771,9 +965,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.label:
         label_existing(args)
         return 0
+    if args.label_pending:
+        label_pending(args)
+        return 0
     if not args.operator or not args.scenario:
         raise SystemExit("record mode needs --operator and --scenario (or use --label VIDEO)")
-    record(args)
+    if args.toggle:
+        record_session(args)
+    else:
+        record(args)
     return 0
 
 
