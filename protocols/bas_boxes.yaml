@@ -1,0 +1,52 @@
+# ISRO sample experiment (SIH 26174): box transfer.
+# The official description is truncated ("...two smaller boxes of color red and yello…"); these
+# steps are our reading of it (build plan, assumption A4). Edit this file only if that changes.
+#
+# Steps are state transitions over world-state predicates (<object>.<predicate>). A step with no
+# `pre` has the implicit precondition "post does not hold yet". Zones are in rack coordinates
+# (metres, see configs/rack.yaml): a 2-point zone is [[xmin, ymin], [xmax, ymax]].
+
+id: bas_boxes_v1
+title: "BAS sample experiment: box transfer"
+version: 1
+
+objects:
+  outer:  {label: "outer box",  classes: [outer_box_closed, outer_box_open, lid]}
+  red:    {label: "red box",    classes: [red_box]}
+  yellow: {label: "yellow box", classes: [yellow_box]}
+
+zones:
+  A: [[0.55, 0.10], [0.80, 0.35]]
+  B: [[0.55, 0.45], [0.80, 0.70]]
+
+initial:
+  outer.open: false
+  red.in_outer: true
+  yellow.in_outer: true
+  red.held: false
+  yellow.held: false
+  red.in_zone_A: false
+  yellow.in_zone_B: false
+
+steps:
+  - {id: S1, text: "Open the outer box",             post: {outer.open: true}}
+  - {id: S2, text: "Take out the red box",           pre: {red.in_outer: true},    post: {red.in_outer: false},    requires_hoi: red}
+  - {id: S3, text: "Place the red box in Zone A",    post: {red.in_zone_A: true},
+     ask: "I couldn't confirm the red box is in Zone A. Did you place it?"}
+  - {id: S4, text: "Take out the yellow box",        pre: {yellow.in_outer: true}, post: {yellow.in_outer: false}, requires_hoi: yellow}
+  - {id: S5, text: "Place the yellow box in Zone B", post: {yellow.in_zone_B: true},
+     ask: "I couldn't confirm the yellow box is in Zone B. Did you place it?"}
+  - {id: S6, text: "Close the outer box",            post: {outer.open: false}}
+
+order: strict            # or a partial order: [[S1, S2], [S1, S4], ...]
+
+timing:
+  dwell_s: 0.8
+  timeout_s: 60
+  min_duration_s: {S3: 1.0}
+
+decision:
+  p_enter: 0.8
+  p_exit: 0.6
+  ask_band: [0.45, 0.8]
+  ask_after_s: 3.0

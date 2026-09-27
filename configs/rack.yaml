@@ -1,0 +1,38 @@
+# Payload-rack geometry (H-PROPS fills in the measured values; T-SPATIAL consumes it).
+#
+# Rack frame: origin at the board's top-left corner as seen by someone facing the rack,
+# +x to the right, +y down, +z into the rack (right-handed). Units are metres.
+# Protocol zones (protocols/*.yaml) are given in this frame.
+#
+# `measured: false` means the numbers below are placeholders. Measure the printed board,
+# replace them, and set `measured: true`.
+
+measured: false
+
+board:
+  width: 0.90
+  height: 0.80
+
+aruco:
+  dictionary: DICT_4X4_50
+  marker_size: 0.060             # black-square edge length, metres
+
+# Marker centres on the board plane (z = 0), metres. Marker corners follow OpenCV's order
+# (top-left, top-right, bottom-right, bottom-left) with each marker upright on the board.
+markers:
+  0: [0.050, 0.050]              # top-left
+  1: [0.850, 0.050]              # top-right
+  2: [0.850, 0.750]              # bottom-right
+  3: [0.050, 0.750]              # bottom-left
+
+# Where the outer box sits on the board (for the world-state model's "in_outer" footprint).
+outer_box_footprint: [[0.15, 0.30], [0.40, 0.55]]
+
+# Camera intrinsics. `calibrated: false` → T-SPATIAL approximates from the image size and
+# `approx_hfov_deg` until a checkerboard calibration fills these in.
+camera:
+  calibrated: false
+  approx_hfov_deg: 70
+  image_size: [1280, 720]
+  K: null                        # [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+  dist: null                     # [k1, k2, p1, p2, k3]

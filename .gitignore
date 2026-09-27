@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+*.egg-info/
+/build/
+/dist/
+
+# Data, weights and run outputs (never committed)
+/data/
+/models/
+/runs/*
+!/runs/eval/
+/bin/
+
+# UI build
+ui/node_modules/
+ui/dist/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
