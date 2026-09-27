@@ -47,6 +47,17 @@ The take recorded so far is kept; start the command again.
 
 ## 3. Record
 
+First check that the camera sees all four board markers. A live window shows them, and you can
+keep moving the markers or the camera until it reads **READY 4/4 markers**. Then press `q`. The
+details are in `Vault/H-FILM-marker-check.md`.
+
+```powershell
+.venv\Scripts\python tools\check_markers.py --source http://192.168.1.23:8080/video
+```
+
+Add `--markers` to any record command below to keep that check running live in the preview (it
+isn't saved into the video).
+
 Use a new `--operator` per person (`op01`, `op02`, ...; no underscores). Use one `--scenario` per
 command; change it by quitting (`q`) and starting again.
 

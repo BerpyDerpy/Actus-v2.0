@@ -11,6 +11,13 @@ saves it, and the next ``r`` starts the next take number. ``q`` ends the session
 
     uv run python tools/record_takes.py --operator op01 --scenario correct --toggle
 
+Check the ArUco markers live while recording (``--markers``): a background thread checks the
+newest frame a few times a second and the preview shows a ``MARKERS 0 1 2 3 READY`` strip, in
+standby too. The strip is never written into the video. Each take's JSON gets a ``markers``
+summary. The standalone check to run before recording is ``tools/check_markers.py``.
+
+    uv run python tools/record_takes.py --operator op01 --scenario correct --toggle --markers
+
 Label a file already recorded (e.g. shot with a phone camera app):
 
     uv run python tools/record_takes.py --label data/raw/op03_correct_02.mp4
@@ -474,6 +481,24 @@ def open_sources(args) -> list:
     return sources
 
 
+def start_marker_monitor(args, sources: list):
+    """``--markers``: live ArUco check of camera 1 on a background thread, or None."""
+    if not args.markers:
+        return None
+    from tools.check_markers import MarkerChecker, MarkerMonitor
+
+    monitor = MarkerMonitor(sources[0], MarkerChecker.from_config())
+    monitor.start()
+    return monitor
+
+
+def draw_markers_on(view: np.ndarray, img: np.ndarray, monitor) -> None:
+    if monitor is not None:
+        from tools.check_markers import draw_marker_strip
+
+        draw_marker_strip(view, monitor.status(), view.shape[1] / img.shape[1])
+
+
 def record(args) -> Path:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -483,9 +508,14 @@ def record(args) -> Path:
         raise SystemExit(f"{out_dir / stem}.mp4 exists; pass --force or another --n")
 
     sources = open_sources(args)
+    monitor = start_marker_monitor(args, sources)
     try:
-        meta_path, _ = record_take(args, sources, out_dir, n, parse_script(args.script))
+        meta_path, _ = record_take(
+            args, sources, out_dir, n, parse_script(args.script), monitor=monitor
+        )
     finally:
+        if monitor is not None:
+            monitor.stop()
         for s in sources:
             s.stop()
         if not args.no_preview:
@@ -500,6 +530,7 @@ def record_session(args) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     take_stem(args.operator, args.scenario, 1)  # validate the names before opening cameras
     sources = open_sources(args)
+    monitor = start_marker_monitor(args, sources)
     script = parse_script(args.script)
     preview = not args.no_preview
     t_session = time.monotonic()
@@ -520,6 +551,7 @@ def record_session(args) -> list[Path]:
                 if latest is not None:
                     lines = [f"STANDBY  next take: {stem}", "press r to start recording"]
                     view = overlay(latest[1], lines, "ready", False, help_text=TOGGLE_HELP_STANDBY)
+                    draw_markers_on(view, latest[1], monitor)
                     cv2.imshow(WINDOW, view)
                 keys.append(cv2.waitKey(1))
             else:
@@ -533,7 +565,7 @@ def record_session(args) -> list[Path]:
                 print(f"{out_dir / stem}.mp4 exists; pass --force or another --n")
                 continue
             meta_path, quit_session = record_take(
-                args, sources, out_dir, n, script, script_t0=t_session, toggle=True
+                args, sources, out_dir, n, script, script_t0=t_session, toggle=True, monitor=monitor
             )
             saved.append(meta_path)
             if quit_session:
@@ -541,6 +573,8 @@ def record_session(args) -> list[Path]:
     except KeyboardInterrupt:
         pass
     finally:
+        if monitor is not None:
+            monitor.stop()
         for s in sources:
             s.stop()
         if preview:
@@ -559,6 +593,7 @@ def record_take(
     script: list[tuple[float, str]],
     script_t0: float | None = None,
     toggle: bool = False,
+    monitor=None,
 ) -> tuple[Path, bool]:
     """Record one take from already-running sources. Returns (metadata path, quit requested).
 
@@ -581,6 +616,8 @@ def record_take(
     stop_reason = "key"
     quit_requested = True
     stop_hint = "r to stop, q to stop and quit" if toggle else "q to stop"
+    if monitor is not None:
+        monitor.reset_stats()
     print(f"recording {stem} at {args.fps:g} fps -> {out_dir}  ({stop_hint})")
 
     try:
@@ -622,6 +659,7 @@ def record_take(
                         f"roll {args.roll}  light {args.lighting}  dup {cams[0].dups}",
                     ]
                     view = overlay(img, lines, track.label_at(frame_idx), True, help_text=help_text)
+                    draw_markers_on(view, img, monitor)
                     cv2.imshow(WINDOW, view)
                 keys.append(cv2.waitKey(1))
             else:
@@ -689,6 +727,11 @@ def record_take(
                   f"the camera delivers fewer than {args.fps:g} fps (lower --fps?)")  # fmt: skip
         if not info["frame_count_ok"]:
             print(f"WARNING {cam.video_path.name}: frame count mismatch {counts} vs {cam.written}")
+    if monitor is not None:
+        mk = meta["markers"] = monitor.summary()  # camera 1, checked live at ~monitor.hz
+        if mk["checks"] and mk["ready_frac"] < 0.5:
+            print(f"WARNING markers: every rack marker visible in only {mk['ready_frac']:.0%} "
+                  f"of checks; per marker {mk['seen_frac']}")  # fmt: skip
     meta_path = out_dir / f"{stem}.json"
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     ok = all(c["frame_count_ok"] for c in meta["cameras"])
@@ -948,6 +991,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--toggle",
         action="store_true",
         help="start in a live standby preview; r starts/stops each take (one file per take)",
+    )
+    ap.add_argument(
+        "--markers",
+        action="store_true",
+        help="live ArUco marker check in the preview and each take's JSON (tools/check_markers.py)",
     )
     ap.add_argument("--no-preview", action="store_true", help="no window (headless / tests)")
     ap.add_argument("--script", help='scripted keys "t:key,...", t = seconds (tests, dry runs)')
