@@ -311,7 +311,7 @@ def count_frames(path: Path) -> dict:
                 capture_output=True, text=True, timeout=120, check=True,
             )  # fmt: skip
             out["ffprobe"] = int(res.stdout.strip().split(",")[0])
-        except (subprocess.SubprocessError, ValueError) as e:
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
             out["ffprobe_error"] = str(e)
     return out
 
