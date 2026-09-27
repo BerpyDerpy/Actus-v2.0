@@ -29,6 +29,7 @@ voice = [
 ui = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    "httpx>=0.27",  # fastapi.testclient.TestClient (HTTP + WebSocket) for tests/test_ui_server.py
 ]
 
 [dependency-groups]
