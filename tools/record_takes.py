@@ -35,6 +35,7 @@ Keys (both modes)
     q / Esc finish and save
   toggle mode only:
     r       start a take (standby) / stop and save it (recording)
+    t       rotate the camera 90 deg (standby only, before recording starts)
   playback only:
     space   pause / resume      .  ,   step one frame forward / back (while paused)
     s       cycle speed 1× → 0.5× → 0.25×          ]  [   jump 5 s forward / back
@@ -93,9 +94,10 @@ STEM_RE = re.compile(
     r"^(?P<op>[A-Za-z0-9-]+)_(?P<sc>[A-Za-z0-9_-]+?)_(?P<n>\d+)(?:_cam(?P<cam>\d+))?$"
 )
 SPEEDS = (1.0, 0.5, 0.25)
+ROTATIONS = (0, 90, 180, 270)
 GRACE = 0.4  # fraction of a frame period to wait for a late camera frame
 KEY_HELP = "1-9 step  0 idle  x other  u undo  q quit"
-TOGGLE_HELP_STANDBY = "r start recording  q quit"
+TOGGLE_HELP_STANDBY = "r start recording  t rotate camera  q quit"
 TOGGLE_HELP_RECORDING = "1-9 step  0 idle  x other  u undo  r stop take  q stop+quit"
 BATCH_HELP = "1-9 step  0 idle  x other  u undo  q save+next  Esc save+stop"
 WINDOW = "ACTUS take recorder"
@@ -210,6 +212,17 @@ class LabelTrack:
 # --------------------------------------------------------------------------------------------
 
 
+def rotate_frame(img: np.ndarray, rotation: int) -> np.ndarray:
+    if rotation == 0:
+        return img
+    mapping = {
+        90: cv2.ROTATE_90_COUNTERCLOCKWISE,
+        180: cv2.ROTATE_180,
+        270: cv2.ROTATE_90_CLOCKWISE,
+    }
+    return cv2.rotate(img, mapping[rotation])
+
+
 class CaptureThread(threading.Thread):
     """Reads a cv2 source as fast as it delivers and keeps only the newest frame."""
 
@@ -235,6 +248,7 @@ class CaptureThread(threading.Thread):
         self._stop = threading.Event()
         self.eof = False
         self.read_count = 0
+        self.rotation = 0
 
     def run(self) -> None:
         seq = 0
@@ -252,7 +266,17 @@ class CaptureThread(threading.Thread):
 
     def latest(self) -> tuple[int, np.ndarray, float] | None:
         with self._lock:
-            return self._latest
+            latest = self._latest
+        if latest is None:
+            return None
+        seq, frame, t = latest
+        return seq, rotate_frame(frame, self.rotation), t
+
+    def rotate(self, *, step: int = 1) -> int:
+        """Cycle the baked-in rotation by 90 deg x ``step`` (mod 360). Call only in standby,
+        before a take starts: changing it mid-take would change the written frame size."""
+        self.rotation = ROTATIONS[(ROTATIONS.index(self.rotation) + step) % len(ROTATIONS)]
+        return self.rotation
 
     def stop(self) -> None:
         self._stop.set()
@@ -276,6 +300,7 @@ class ReplayFrames(threading.Thread):
         self._stop = threading.Event()
         self.eof = False
         self.read_count = 0
+        self.rotation = 0
 
     def run(self) -> None:
         start = time.monotonic()
@@ -292,7 +317,17 @@ class ReplayFrames(threading.Thread):
 
     def latest(self):
         with self._lock:
-            return self._latest
+            latest = self._latest
+        if latest is None:
+            return None
+        seq, frame, t = latest
+        return seq, rotate_frame(frame, self.rotation), t
+
+    def rotate(self, *, step: int = 1) -> int:
+        """Cycle the baked-in rotation by 90 deg x ``step`` (mod 360). Call only in standby,
+        before a take starts: changing it mid-take would change the written frame size."""
+        self.rotation = ROTATIONS[(ROTATIONS.index(self.rotation) + step) % len(ROTATIONS)]
+        return self.rotation
 
     def stop(self) -> None:
         self._stop.set()
@@ -390,6 +425,7 @@ class CamRecorder:
             "frames_csv": self.frames_path.name,
             **self.src.describe(),
             "resolution": list(self.size) if self.size else None,
+            "rotation_deg": self.src.rotation,
             "frames_written": self.written,
             "duplicated_frames": self.dups,
             "camera_frames_skipped": self.cam_skipped,
@@ -536,8 +572,8 @@ def record_session(args) -> list[Path]:
     t_session = time.monotonic()
     saved: list[Path] = []
     first_n = args.n
-    print(f"standby: r = start/stop a take, q = quit  (operator {args.operator}, "
-          f"scenario {args.scenario}) -> {out_dir}")  # fmt: skip
+    print(f"standby: r = start/stop a take, t = rotate camera, q = quit  (operator "
+          f"{args.operator}, scenario {args.scenario}) -> {out_dir}")  # fmt: skip
     try:
         while not any(s.eof for s in sources):
             n = first_n or next_take_number(out_dir, args.operator, args.scenario)
@@ -549,7 +585,10 @@ def record_session(args) -> list[Path]:
             if preview:
                 latest = sources[0].latest()
                 if latest is not None:
-                    lines = [f"STANDBY  next take: {stem}", "press r to start recording"]
+                    lines = [
+                        f"STANDBY  next take: {stem}",
+                        f"press r to start recording  (rotation {sources[0].rotation} deg, t to rotate)",
+                    ]
                     view = overlay(latest[1], lines, "ready", False, help_text=TOGGLE_HELP_STANDBY)
                     draw_markers_on(view, latest[1], monitor)
                     cv2.imshow(WINDOW, view)
@@ -558,6 +597,9 @@ def record_session(args) -> list[Path]:
                 time.sleep(1 / args.fps)
             if any(k in (ord("q"), 27) for k in keys):
                 break
+            if ord("t") in keys:
+                rot = sources[0].rotate()
+                print(f"  camera rotation -> {rot} deg")
             if ord("r") not in keys:
                 continue
             first_n = None
@@ -656,7 +698,8 @@ def record_take(
                 if img is not None:
                     lines = [
                         f"{stem}  f{frame_idx}  {elapsed:6.1f}s",
-                        f"roll {args.roll}  light {args.lighting}  dup {cams[0].dups}",
+                        f"roll {args.roll}  rotation {cams[0].src.rotation}deg  "
+                        f"light {args.lighting}  dup {cams[0].dups}",
                     ]
                     view = overlay(img, lines, track.label_at(frame_idx), True, help_text=help_text)
                     draw_markers_on(view, img, monitor)

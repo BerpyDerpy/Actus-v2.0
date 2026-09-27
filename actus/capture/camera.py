@@ -12,6 +12,8 @@ reaches EOF once and stops; it is never rewound or reopened. ``t_capture`` is
 
 ``rotation`` (0/90/180/270, degrees CCW) is applied to every frame before it is published, and
 recorded on the packet as ``rotation_applied`` so downstream lanes never need to guess it.
+``Camera.rotate()`` changes it live -- e.g. for a "rotate camera" button in a standby preview
+before recording starts -- and takes effect on the next captured frame.
 """
 
 from __future__ import annotations
@@ -75,6 +77,7 @@ class Camera:
         self.rotation = rotation
         self.max_live_read_failures = max_live_read_failures
         self._is_file = _is_file_source(source)
+        self._rotation_lock = threading.Lock()
         # Overridable for tests: a zero-arg callable returning a VideoCapture-like object,
         # in place of the real ``cv2.VideoCapture(source)``.
         self._capture_factory = capture_factory
@@ -116,6 +119,15 @@ class Camera:
         if self._thread is not None:
             self._thread.join(timeout)
 
+    def rotate(self, *, step: int = 1) -> int:
+        """Cycle the live rotation by 90deg x ``step`` (mod 360) while capturing -- e.g. a
+        "rotate camera" button in a standby preview before recording starts. Thread-safe;
+        takes effect on the next captured frame. Returns the new rotation."""
+        with self._rotation_lock:
+            idx = ROTATIONS.index(self.rotation)
+            self.rotation = ROTATIONS[(idx + step) % len(ROTATIONS)]
+            return self.rotation
+
     def _open(self) -> None:
         import cv2
 
@@ -151,10 +163,12 @@ class Camera:
                     continue
                 consecutive_failures = 0
                 t_capture = self._timestamp()
-                if self.rotation:
-                    image = self._rotate(image)
+                with self._rotation_lock:
+                    rotation = self.rotation
+                if rotation:
+                    image = self._rotate(image, rotation)
                 packet = FramePacket(
-                    self.frames_captured, t_capture, image, self.source_id, self.rotation
+                    self.frames_captured, t_capture, image, self.source_id, rotation
                 )
                 self.frames_captured += 1
                 bus.publish(topic, packet)
@@ -175,7 +189,7 @@ class Camera:
             return time.monotonic() - self._started_monotonic
         return time.monotonic()
 
-    def _rotate(self, image: np.ndarray) -> np.ndarray:
+    def _rotate(self, image: np.ndarray, rotation: int) -> np.ndarray:
         import cv2
 
         mapping = {
@@ -183,7 +197,7 @@ class Camera:
             180: cv2.ROTATE_180,
             270: cv2.ROTATE_90_CLOCKWISE,
         }
-        return cv2.rotate(image, mapping[self.rotation])
+        return cv2.rotate(image, mapping[rotation])
 
     def _release(self) -> None:
         if self._cap is not None:
