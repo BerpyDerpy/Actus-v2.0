@@ -3,7 +3,7 @@ name = "actus"
 version = "0.1.0"
 description = "ACTUS: on-board human activity recognition that validates experiment protocols (SIH 26174)"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11,<3.16"
 dependencies = [
     "numpy>=1.26",
     "pyyaml>=6.0",
@@ -19,6 +19,7 @@ perception = [
     "ultralytics>=8.3",
     "mediapipe>=0.10.14",
     "onnxruntime>=1.18",
+    "lap>=0.5.12",  # required by ultralytics' ByteTrack (model.track()); not auto-pulled otherwise
 ]
 voice = [
     "kokoro-onnx>=0.4",
