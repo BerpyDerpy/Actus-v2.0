@@ -40,6 +40,7 @@ perception = [
 ]
 ui = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 voice = [
@@ -59,6 +60,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'ui'", specifier = ">=0.115" },
+    { name = "httpx", marker = "extra == 'ui'", specifier = ">=0.27" },
     { name = "kokoro-onnx", marker = "extra == 'voice'", specifier = ">=0.4" },
     { name = "lap", marker = "extra == 'perception'", specifier = ">=0.5.12" },
     { name = "mediapipe", marker = "extra == 'perception'", specifier = ">=0.10.14" },
