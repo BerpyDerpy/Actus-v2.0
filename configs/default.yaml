@@ -64,9 +64,17 @@ rack:                            # T-SPATIAL (rack_frame.py)
 spatial: {}                      # T-SPATIAL (zones.py, world_state.py, predicates.py)
 
 models:                          # T-HOI-TEMP
-  hoi: models/hoi/hoi.onnx
-  temporal: models/temporal/temporal.onnx
-  window_s: 2.0
+  enabled: true
+  # Path stems, not files: <stem>.npz is the model of record (numpy, always loadable) and
+  # <stem>.onnx is used instead when it exists and onnxruntime is installed.
+  hoi: models/hoi/hoi
+  temporal: models/temporal/temporal
+  prefer_onnx: true
+  feature_fps: 15                # fixed rate the temporal model consumes, whatever the camera does
+  window_s: 2.0                  # receptive field it was trained with
+  fusion:
+    enabled: true
+    temporal_weight: 0.5         # capped by the evidence's `armed` latch (actus/models/fusion.py)
 
 voice:                           # T-VOICE
   enabled: true

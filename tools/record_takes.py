@@ -18,6 +18,13 @@ summary. The standalone check to run before recording is ``tools/check_markers.p
 
     uv run python tools/record_takes.py --operator op01 --scenario correct --toggle --markers
 
+Check the rig is ready before recording (camera opens, output path is writable, disk space,
+and a live ArUco marker check — the same READY/PARTIAL/NOT READY view as
+``tools/check_markers.py``). Nothing is recorded; exit status is 0 when everything checked out,
+1 otherwise, so it can gate a recording script:
+
+    uv run python tools/record_takes.py --operator op01 --scenario correct --check-ready
+
 Label a file already recorded (e.g. shot with a phone camera app):
 
     uv run python tools/record_takes.py --label data/raw/op03_correct_02.mp4
@@ -37,8 +44,11 @@ Keys (both modes)
     r       start a take (standby) / stop and save it (recording)
     t       rotate the camera 90 deg (standby only, before recording starts)
   playback only:
+    r       begin playback (standby: shows the filename, waits so you're ready before it plays)
     space   pause / resume      .  ,   step one frame forward / back (while paused)
     s       cycle speed 1× → 0.5× → 0.25×          ]  [   jump 5 s forward / back
+    u       at the end of the file: discard this take's labels and play it again from the start
+            (otherwise: undo the last label, as above)
   --label-pending only:
     q       save and open the next pending take     Esc save and stop the batch
 
@@ -485,6 +495,69 @@ def timeline_bar(view: np.ndarray, track: LabelTrack, pos: int, total: int) -> N
 
 
 # --------------------------------------------------------------------------------------------
+# Check-ready (run before recording)
+# --------------------------------------------------------------------------------------------
+
+
+def check_ready(args) -> int:
+    """``--check-ready``: static setup checks plus a live marker check, before the video starts.
+    Never records. Returns the process exit status (0 = ready, 1 = not)."""
+    ok = True
+
+    if args.operator and args.scenario:
+        out_dir = Path(args.out)
+        try:
+            n = args.n or next_take_number(out_dir, args.operator, args.scenario)
+            stem = take_stem(args.operator, args.scenario, n)
+            print(f"PASS  take name: {stem}")
+            if (out_dir / f"{stem}.mp4").exists() and not args.force:
+                print(f"FAIL  {out_dir / stem}.mp4 already exists (pass --force or another --n)")
+                ok = False
+        except ValueError as e:
+            print(f"FAIL  {e}")
+            ok = False
+    else:
+        print("SKIP  take name: --operator/--scenario not given")
+
+    out_dir = Path(args.out)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        probe = out_dir / ".check_ready_tmp"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        print(f"PASS  output directory writable: {out_dir}")
+    except OSError as e:
+        print(f"FAIL  output directory not writable: {out_dir} ({e})")
+        ok = False
+
+    free_gb = shutil.disk_usage(out_dir).free / 1e9
+    if free_gb < 1.0:
+        print(f"FAIL  only {free_gb:.2f} GB free on {out_dir}")
+        ok = False
+    else:
+        print(f"PASS  {free_gb:.1f} GB free on {out_dir}")
+
+    print("-- live rig check (camera + ArUco markers) --")
+    from tools.check_markers import main as marker_main
+
+    marker_argv = [
+        "--source", args.source,
+        "--width", str(args.width),
+        "--height", str(args.height),
+        "--fps", str(args.fps),
+        "--api", args.api,
+    ]  # fmt: skip
+    if args.no_preview:
+        marker_argv.append("--no-preview")
+    if args.duration:
+        marker_argv += ["--duration", str(args.duration)]
+    ok = marker_main(marker_argv) == 0 and ok
+
+    print("READY to record" if ok else "NOT READY")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------------------------
 # Record mode
 # --------------------------------------------------------------------------------------------
 
@@ -587,7 +660,7 @@ def record_session(args) -> list[Path]:
                 if latest is not None:
                     lines = [
                         f"STANDBY  next take: {stem}",
-                        f"press r to start recording  (rotation {sources[0].rotation} deg, t to rotate)",
+                        f"press r to record  (rotation {sources[0].rotation}°, t to rotate)",
                     ]
                     view = overlay(latest[1], lines, "ready", False, help_text=TOGGLE_HELP_STANDBY)
                     draw_markers_on(view, latest[1], monitor)
@@ -862,10 +935,34 @@ def pending_takes(folder: Path) -> list[Path]:
     return out
 
 
+def validate_raw_dir(folder: Path) -> list[str]:
+    """Sanity-check every ``.mp4`` in ``folder``: the name matches
+    ``{operator}_{scenario}_{n}[_camN]``, and every camera has its ``.frames.csv`` sidecar (cam 1
+    also needs ``.csv`` labels and ``.json`` metadata). One problem string per issue found."""
+    problems: list[str] = []
+    for video in sorted(folder.glob("*.mp4")):
+        try:
+            info = parse_take_stem(video.stem)
+        except ValueError:
+            problems.append(f"{video.name}: name does not match {{operator}}_{{scenario}}_{{n}}")
+            continue
+        frames_path = video.with_name(video.stem + ".frames.csv")
+        if not frames_path.exists():
+            problems.append(f"{video.name}: missing {frames_path.name}")
+        if info["cam"] == 1:
+            for suffix, kind in ((".csv", "labels"), (".json", "metadata")):
+                sidecar = video.with_suffix(suffix)
+                if not sidecar.exists():
+                    problems.append(f"{video.name}: missing {kind} file {sidecar.name}")
+    return problems
+
+
 def label_pending(args) -> list[Path]:
     folder = Path(args.label_pending)
     if not folder.is_dir():
         raise SystemExit(f"{folder} is not a folder")
+    for problem in validate_raw_dir(folder):
+        print(f"WARNING {problem}")
     todo = pending_takes(folder)
     if not todo:
         print(f"nothing to label in {folder}")
@@ -892,7 +989,10 @@ def label_existing(args) -> Path:
 def label_video(
     args, video: Path, progress: str = "", help_text: str = KEY_HELP
 ) -> tuple[Path, bool]:
-    """Play ``video`` and label it. Returns (labels CSV path, Esc pressed)."""
+    """Play ``video`` and label it. Starts in a standby screen naming the file; ``r`` begins
+    playback (skipped with no preview window: tests / dry runs have nothing to wait for). At the
+    end of the file ``u`` discards this take's labels and restarts it from frame 0 instead of
+    undoing one label. Returns (labels CSV path, Esc pressed)."""
     if not video.exists():
         raise SystemExit(f"{video} not found")
     labels_path = video.with_suffix(".csv")
@@ -906,34 +1006,63 @@ def label_video(
     if not fps or fps <= 0 or fps > 240:
         raise SystemExit(f"{video}: container reports no usable fps; re-mux it with ffmpeg first")
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    end_t = total / fps  # strictly after the last real frame's timestamp; marks "at the end"
     window = f"ACTUS labeller - {video.name}"
     script = parse_script(args.script)
     preview = not args.no_preview
     player = _Player(cap, args.ring)
     if not player.forward():
         raise SystemExit(f"{video}: no decodable frames")
+    name_line = f"{progress}  {video.name}" if progress else video.name
 
-    paused, speed_i = False, 0
+    standby = preview  # a human decides when to start; headless runs (tests) start immediately
+    paused, ended, speed_i = False, False, 0
     esc = False
     next_due = time.monotonic() + 1.0 / fps
     while True:
+        if standby:
+            pos, t, img = player.current
+            keys: list[int] = []
+            while script and script[0][0] <= t:
+                keys.append(ord(script.pop(0)[1][0]))
+            if preview:
+                view = overlay(
+                    img, [name_line, "press r to begin"], "standby", False,
+                    max_w=args.view_width, help_text="r begin   q / Esc skip",
+                )  # fmt: skip
+                cv2.imshow(window, view)
+                keys.append(cv2.waitKey(1))
+            if any(k in (ord("q"), 27) for k in keys):
+                cap.release()
+                if preview:
+                    cv2.destroyAllWindows()
+                return labels_path, 27 in keys  # never started: leave the take pending
+            if ord("r") in keys:
+                standby = False
+                next_due = time.monotonic() + 1.0 / fps
+            continue
+
         # Without a window there is nothing to pace for: run through the file (tests, dry runs).
-        if not paused and (not preview or time.monotonic() >= next_due):
+        if not paused and not ended and (not preview or time.monotonic() >= next_due):
             if not player.forward():
-                if not preview or args.exit_at_end:
+                if args.exit_at_end:
                     break
-                paused = True  # hold on the last frame; q saves and quits
+                ended = True
+                paused = True  # hold on the last frame
             next_due = time.monotonic() + 1.0 / (fps * SPEEDS[speed_i])
         pos, t, img = player.current
+        if ended:
+            t = end_t  # distinct from any real frame's t, so a scripted key can target "the end"
 
-        keys: list[int] = []
+        keys = []
         while script and script[0][0] <= t:
             keys.append(ord(script.pop(0)[1][0]))
         if preview:
-            state = f"  {SPEEDS[speed_i]:g}x" + ("  PAUSED" if paused else "")
-            lines = [f"f{pos}/{total}  {t:7.2f}s{state}", "space pause  . , step  [ ] 5s  s speed"]
-            if progress:
-                lines.insert(0, f"{progress}  {video.name}")
+            state = f"  {SPEEDS[speed_i]:g}x" + ("  PAUSED" if paused and not ended else "")
+            if ended:
+                state = "  END  u restart   q/Esc save+quit"
+            lines = [f"{name_line}  f{pos}/{total}  {t:7.2f}s{state}",
+                     "space pause  . , step  [ ] 5s  s speed"]  # fmt: skip
             view = overlay(
                 img, lines, track.label_at(pos), False, max_w=args.view_width, help_text=help_text
             )
@@ -944,24 +1073,40 @@ def label_video(
         if any(k in (ord("q"), 27) for k in keys):
             esc = 27 in keys
             break
+        restarted = False
         for key in keys:
-            if key == ord(" "):
+            if key == ord(" ") and not ended:
                 paused = not paused
             elif key == ord("s"):
                 speed_i = (speed_i + 1) % len(SPEEDS)
-            elif key == ord(".") and paused:
+            elif key == ord(".") and paused and not ended:
                 player.forward()
             elif key == ord(",") and paused:
                 player.back()
+                ended = False
             elif key in (ord("]"), ord("[")):
                 player.seek(pos + round((5 if key == ord("]") else -5) * fps))
+                ended = False
             elif key in (ord("u"), 8):
-                track.undo()
-                track.save(labels_path)
-            elif lab := key_to_label(key):
+                if ended:
+                    track = LabelTrack()
+                    track.save(labels_path)
+                    player.seek(0)
+                    paused, ended = False, False
+                    standby = preview
+                    restarted = True
+                    print(f"  restarting {video.name}")
+                else:
+                    track.undo()
+                    track.save(labels_path)
+            elif not ended and (lab := key_to_label(key)):
                 track.set(pos, t, lab)
                 track.save(labels_path)
                 print(f"  f{pos:6d} {t:7.2f}s  {lab}")
+        if restarted:
+            continue
+        if ended and not preview:
+            break  # headless: nothing more will ever arrive
 
     cap.release()
     if preview:
@@ -1040,6 +1185,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="live ArUco marker check in the preview and each take's JSON (tools/check_markers.py)",
     )
+    ap.add_argument(
+        "--check-ready",
+        action="store_true",
+        help="check camera, markers, output path and disk space, then exit; no recording",
+    )
     ap.add_argument("--no-preview", action="store_true", help="no window (headless / tests)")
     ap.add_argument("--script", help='scripted keys "t:key,...", t = seconds (tests, dry runs)')
     ap.add_argument("--force", action="store_true", help="overwrite / ignore existing outputs")
@@ -1053,6 +1203,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.fps <= 0:
         raise SystemExit("--fps must be > 0")
+    if args.check_ready:
+        return check_ready(args)
     if args.label:
         label_existing(args)
         return 0

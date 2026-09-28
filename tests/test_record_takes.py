@@ -146,6 +146,35 @@ def test_label_pending_labels_only_unlabelled_takes(tmp_path):
     assert rt.pending_takes(tmp_path) == []
 
 
+def test_check_ready_passes_for_replay_source(tmp_path, capsys):
+    rc = rt.main([
+        "--operator", "op00", "--scenario", "selftest", "--source", "replay:correct",
+        "--fps", "15", "--no-preview", "--out", str(tmp_path), "--check-ready",
+        "--duration", "1.0",
+    ])  # fmt: skip
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "PASS  take name: op00_selftest_01" in out
+    assert "READY to record" in out
+    assert list(tmp_path.glob("*.mp4")) == []  # never records
+
+
+def test_check_ready_fails_when_take_already_exists(tmp_path, capsys):
+    rt.main([
+        "--operator", "op00", "--scenario", "selftest", "--source", "replay:correct",
+        "--fps", "15", "--duration", "1", "--no-preview", "--out", str(tmp_path),
+    ])  # fmt: skip
+    rc = rt.main([
+        "--operator", "op00", "--scenario", "selftest", "--n", "1", "--source", "replay:correct",
+        "--fps", "15", "--no-preview", "--out", str(tmp_path), "--check-ready",
+        "--duration", "1.0",
+    ])  # fmt: skip
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "already exists" in out
+    assert "NOT READY" in out
+
+
 def test_playback_labelling(tmp_path):
     # make a short file first, then label it in playback mode (no window)
     rt.main([
@@ -159,3 +188,43 @@ def test_playback_labelling(tmp_path):
     assert int(labels[1]["frame_idx"]) == 6  # first frame at t >= 0.4 s at 15 fps
     meta = json.loads(video.with_suffix(".json").read_text(encoding="utf-8"))
     assert meta["labelled_with"]["tool"] == "record_takes --label"
+
+
+def test_label_video_headless_skips_standby(tmp_path):
+    # --no-preview has no window to wait in front of, so labelling starts immediately without
+    # needing a scripted "r" (this is what all the other headless tests above already rely on).
+    rt.main([
+        "--operator", "op00", "--scenario", "pb", "--source", "replay:correct",
+        "--fps", "15", "--duration", "1", "--no-preview", "--out", str(tmp_path),
+    ])  # fmt: skip
+    video = tmp_path / "op00_pb_01.mp4"
+    rt.main(["--label", str(video), "--no-preview", "--force", "--script", "0.2:1"])
+    assert [r["label"] for r in _rows(video.with_suffix(".csv"))] == ["idle", "S1"]
+
+
+def test_label_video_u_at_end_restarts_and_discards_labels(tmp_path, capsys):
+    rt.main([
+        "--operator", "op00", "--scenario", "pb2", "--source", "replay:correct",
+        "--fps", "10", "--duration", "1", "--no-preview", "--out", str(tmp_path),
+    ])  # fmt: skip
+    video = tmp_path / "op00_pb2_01.mp4"
+    meta = json.loads(video.with_suffix(".json").read_text(encoding="utf-8"))
+    end_t = meta["frames"] / 10.0  # strictly after the last real frame's timestamp
+    rt.main(["--label", str(video), "--no-preview", "--force", "--script", f"0.3:2,{end_t}:u"])
+    out = capsys.readouterr().out
+    assert "restarting" in out
+    # the S2 press was discarded by the restart; the replayed second pass adds nothing more
+    assert [r["label"] for r in _rows(video.with_suffix(".csv"))] == ["idle"]
+
+
+def test_validate_raw_dir_flags_bad_names_and_missing_sidecars(tmp_path):
+    rt.main([
+        "--operator", "op00", "--scenario", "ok", "--source", "replay:correct",
+        "--fps", "10", "--duration", "0.5", "--no-preview", "--out", str(tmp_path),
+    ])  # fmt: skip
+    (tmp_path / "phonefile.mp4").touch()  # doesn't follow the naming convention
+    (tmp_path / "op00_missing_01.mp4").touch()  # named correctly, but no sidecars at all
+    problems = rt.validate_raw_dir(tmp_path)
+    assert any("phonefile.mp4" in p and "does not match" in p for p in problems)
+    assert sum("op00_missing_01.mp4" in p for p in problems) == 3  # frames.csv, csv, json
+    assert not any("op00_ok_01.mp4" in p for p in problems)
