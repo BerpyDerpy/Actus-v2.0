@@ -31,6 +31,7 @@ from tools._datalib import (  # noqa: E402
     CLASSES,
     Box,
     read_manifest,
+    read_reviewed,
     rel_to_repo,
     to_repo_path,
     write_classes,
@@ -75,17 +76,23 @@ def autolabel_manifest(
     *,
     classes: tuple[str, ...] = CLASSES,
     min_conf: float = 0.0,
+    skip: set[str] | frozenset[str] = frozenset(),
 ) -> dict:
     """Run ``propose`` over every manifest row and write YOLO labels under ``out_dir``. Returns a
-    summary report (per-class counts and mean confidence)."""
+    summary report (per-class counts and mean confidence). Rows whose ``image_path`` is in
+    ``skip`` (frames a human already reviewed) are left untouched."""
     out_dir.mkdir(parents=True, exist_ok=True)
     write_classes(out_dir / "classes.txt", classes)
 
     per_class_n = dict.fromkeys(classes, 0)
     per_class_conf: dict[str, list[float]] = {c: [] for c in classes}
     n_empty = 0
+    n_skipped = 0
 
     for row in rows:
+        if row["image_path"] in skip:
+            n_skipped += 1
+            continue
         image_path = REPO_ROOT / row["image_path"]
         img = cv2.imread(str(image_path))
         if img is None:
@@ -102,7 +109,8 @@ def autolabel_manifest(
         write_yolo_label(label_path, boxes, w, h, classes)
 
     report = {
-        "n_frames": len(rows),
+        "n_frames": len(rows) - n_skipped,
+        "n_frames_skipped_reviewed": n_skipped,
         "n_frames_with_no_proposals": n_empty,
         "min_conf": min_conf,
         "classes": list(classes),
@@ -121,6 +129,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out-dir", default="data/labels")
     ap.add_argument("--weights", default="yolov8s-worldv2.pt")
     ap.add_argument("--conf", type=float, default=0.15)
+    ap.add_argument(
+        "--overwrite-reviewed",
+        action="store_true",
+        help="also re-propose frames review_labels.py has accepted (loses the human edits)",
+    )
     args = ap.parse_args(argv)
 
     manifest_path = to_repo_path(args.manifest)
@@ -136,10 +149,13 @@ def main(argv: list[str] | None = None) -> int:
     proposer = YoloWorldProposer(prompts, weights=args.weights, conf=args.conf)
 
     out_dir = to_repo_path(args.out_dir)
-    report = autolabel_manifest(rows, proposer, out_dir, min_conf=args.conf)
+    reviewed = read_reviewed(out_dir / "review_status.csv") or set()
+    skip = set() if args.overwrite_reviewed else reviewed
+    report = autolabel_manifest(rows, proposer, out_dir, min_conf=args.conf, skip=skip)
     print(
         f"labelled {report['n_frames']} frames "
-        f"({report['n_frames_with_no_proposals']} with no proposals) -> {rel_to_repo(out_dir)}\n"
+        f"({report['n_frames_with_no_proposals']} with no proposals; "
+        f"{report['n_frames_skipped_reviewed']} already reviewed, kept) -> {rel_to_repo(out_dir)}\n"
         f"counts: {report['per_class_count']}"
     )
     return 0

@@ -9,6 +9,15 @@ winning result back into the frame's own pixel coordinates before it becomes a `
 ``estimate`` call, not four: a full search only runs every ``every_n_frames`` frames, or sooner
 if confidence at the cached rotation drops below ``conf_threshold``.
 
+Each candidate rotation gets its own ``HandPoseEstimator`` (``estimator.clone()``, created on first
+use). MediaPipe's VIDEO mode tracks landmarks from one call to the next; sharing one instance would
+start every probe from the ROI tracked at a different rotation, and leave the winner starting from
+the last probe's ROI.
+
+``rotate_point`` / ``unrotate_point`` use the pixel-index convention (matching ``cv2.rotate`` on
+the pixel grid). Landmarks are continuous coordinates (``lm.x * w``, pixel ``i`` spans
+``[i, i+1)``), so ``_unrotate_points`` shifts by half a pixel around the call.
+
     tta = RotationTTA.from_config(cfg.perception)
     hand_set, pose_set = tta.process(frame_packet)
     tta.rotation_used   # the winning rotation, degrees CCW
@@ -76,10 +85,15 @@ def rotate_image(image: np.ndarray, degrees_ccw: int) -> np.ndarray:
 def _unrotate_points(pts: np.ndarray, w: int, h: int, degrees_ccw: int) -> np.ndarray:
     if degrees_ccw == 0 or pts.size == 0:
         return pts
+    # Continuous -> pixel-centre convention and back, so x in [0, w] maps onto [0, w] exactly.
     xy = np.array(
-        [unrotate_point(float(x), float(y), w, h, degrees_ccw) for x, y in pts[:, :2]],
+        [
+            unrotate_point(float(x) - 0.5, float(y) - 0.5, w, h, degrees_ccw)
+            for x, y in pts[:, :2]
+        ],
         dtype=pts.dtype,
     )
+    xy = xy + 0.5
     return xy if pts.shape[1] == 2 else np.concatenate([xy, pts[:, 2:]], axis=1)
 
 
@@ -104,7 +118,9 @@ def _unrotate_raw(raw: RawEstimate, orig_w: int, orig_h: int, degrees_ccw: int) 
             pose.visibility,
             pose.conf,
         )
-    return RawEstimate(RawHands(hands), pose)
+    return RawEstimate(
+        RawHands(hands), pose, hands_enabled=raw.hands_enabled, pose_enabled=raw.pose_enabled
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -133,6 +149,7 @@ class RotationTTA:
         self.every_n_frames = max(1, every_n_frames)
         self.rotation_used = 0 if 0 in candidates else candidates[0]
         self._frames_since_search = 0
+        self._estimators: dict[int, HandPoseEstimator] = {}
 
     @classmethod
     def from_config(cls, cfg: Any) -> RotationTTA:
@@ -166,12 +183,30 @@ class RotationTTA:
 
         unrotated = _unrotate_raw(raw, w, h, self.rotation_used)
         fi, t, rot = frame.frame_idx, frame.t_capture, self.rotation_used
-        hand_set = build_hand_set(fi, t, unrotated.hands.hands, rotation_used=rot)
+        mirrored = bool(getattr(self.estimator, "mirrored_input", False))
+        hand_set = build_hand_set(
+            fi, t, unrotated.hands.hands, rotation_used=rot, mirrored_input=mirrored
+        )
         pose_set = build_pose_set(fi, t, unrotated.pose, rotation_used=rot)
         return hand_set, pose_set
 
+    def _estimator_for(self, degrees_ccw: int) -> HandPoseEstimator:
+        est = self._estimators.get(degrees_ccw)
+        if est is None:
+            # The first rotation ever probed uses the estimator we were given; the rest clone it.
+            est = self.estimator if not self._estimators else self.estimator.clone()
+            self._estimators[degrees_ccw] = est
+        return est
+
     def _estimate_at(self, image: np.ndarray, ts: int, degrees_ccw: int) -> RawEstimate:
-        return self.estimator.estimate(rotate_image(image, degrees_ccw), ts)
+        return self._estimator_for(degrees_ccw).estimate(rotate_image(image, degrees_ccw), ts)
+
+    def close(self) -> None:
+        for est in self._estimators.values():
+            est.close()
+        self._estimators.clear()
+        if self.estimator is not None:
+            self.estimator.close()
 
     def _search(
         self, image: np.ndarray, ts: int, *, current_rotation: int, current_raw: RawEstimate

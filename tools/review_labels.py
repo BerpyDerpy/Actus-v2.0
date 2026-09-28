@@ -10,6 +10,9 @@ Boxes are numbered in the overlay next to their class and confidence (if any). K
     space/Enter accept the frame and advance      b          back to the previous frame
     u         undo the last edit on this frame    q / Esc    save and quit
 
+``q``/Esc and ``b`` save the current frame's edits (if it has any) to its ``.txt`` before leaving
+it, but only space/Enter marks a frame *accepted* in the status file.
+
 Target throughput: 400 frames/hour. Edits are written straight back to the YOLO ``.txt`` files;
 ``data/labels/review_status.csv`` records which frames have been accepted.
 
@@ -94,6 +97,9 @@ class FrameReview:
         self.boxes[self.selected] = Box(cls_name, b.x1, b.y1, b.x2, b.y2, b.conf)
 
     def add_box(self, x1: float, y1: float, x2: float, y2: float, cls_name: str) -> None:
+        # A drag can end outside the window; keep the box inside the image.
+        x1, x2 = max(0.0, min(x1, self.img_w)), max(0.0, min(x2, self.img_w))
+        y1, y2 = max(0.0, min(y1, self.img_h)), max(0.0, min(y2, self.img_h))
         if x2 <= x1 or y2 <= y1:
             return
         self._push()
@@ -104,6 +110,11 @@ class FrameReview:
         if self._history:
             self.boxes = self._history.pop()
             self.selected = None
+
+    @property
+    def dirty(self) -> bool:
+        """Edited since it was loaded (and not undone back to the start)."""
+        return bool(self._history)
 
     def save(self) -> None:
         write_yolo_label(self.label_path, self.boxes, self.img_w, self.img_h, self.classes)
@@ -279,6 +290,8 @@ def _interactive_review(
             pending_draw, mode = done, "await_draw_class"
 
         if key in (27, ord("q")):
+            if review.dirty:
+                review.save()  # "save and quit": keep this frame's edits (not marked accepted)
             break
         elif key in (ord(" "), 13):
             review.save()
@@ -288,6 +301,8 @@ def _interactive_review(
                 review = load_review(rows[i], labels_dir, classes)
             mode = "normal"
         elif key == ord("b") and i > 0:
+            if review.dirty:
+                review.save()
             i -= 1
             review = load_review(rows[i], labels_dir, classes)
             mode = "normal"

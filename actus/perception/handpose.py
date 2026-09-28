@@ -12,6 +12,11 @@ result back to the frame's own coordinates; it is the path a real pipeline uses.
 ``process`` exists for the simple case (rotation TTA disabled, or a known-upright camera) and as
 the primitive rotation_tta calls into.
 
+**Handedness.** MediaPipe labels hands assuming a mirrored (selfie) image. A normal camera feed
+is not mirrored, so by default (``mirrored_input=False``) the label is swapped, and
+``HandObs.side`` is the operator's own hand. Set ``perception.mirrored_input: true`` only for a
+source that already flips its frames horizontally.
+
 VIDEO-mode landmarkers require strictly increasing timestamps per instance. ``estimate`` clamps
 every timestamp to be greater than the last one it was given, so a caller that probes the same
 frame more than once (rotation TTA) never has to track this itself.
@@ -75,14 +80,20 @@ class RawPose:
 class RawEstimate:
     hands: RawHands
     pose: RawPose
+    # Which landmarkers actually ran. A disabled one must not count as "found nothing", or a
+    # hands-only estimator would score every frame at half its hand confidence.
+    hands_enabled: bool = True
+    pose_enabled: bool = True
 
     @property
     def confidence(self) -> float:
         """Combined score rotation TTA uses to rank candidate rotations."""
-        signals = [self.pose.conf]
+        signals = []
+        if self.pose_enabled:
+            signals.append(self.pose.conf)
         if self.hands.hands:
             signals.append(self.hands.mean_conf)
-        return float(np.mean(signals))
+        return float(np.mean(signals)) if signals else 0.0
 
 
 # --------------------------------------------------------------------------------------------
@@ -104,6 +115,7 @@ class HandPoseEstimator:
         pose_model_path: str | Path | None = None,
         min_hand_conf: float = 0.5,
         min_pose_conf: float = 0.5,
+        mirrored_input: bool = False,
     ) -> None:
         self.enable_hands = enable_hands
         self.enable_pose = enable_pose
@@ -113,6 +125,7 @@ class HandPoseEstimator:
         self.pose_model_path = pose_model_path
         self.min_hand_conf = min_hand_conf
         self.min_pose_conf = min_pose_conf
+        self.mirrored_input = mirrored_input
         self._hand_landmarker: Any = None
         self._pose_landmarker: Any = None
         self._loaded = False
@@ -129,6 +142,22 @@ class HandPoseEstimator:
             pose_model_path=cfg.get("pose_model_path"),
             min_hand_conf=float(cfg.get("min_hand_conf", 0.5)),
             min_pose_conf=float(cfg.get("min_pose_conf", 0.5)),
+            mirrored_input=bool(cfg.get("mirrored_input", False)),
+        )
+
+    def clone(self) -> HandPoseEstimator:
+        """A fresh, unloaded estimator with the same settings. VIDEO-mode landmarkers carry
+        tracking state between calls, so rotation TTA gives each candidate rotation its own."""
+        return HandPoseEstimator(
+            enable_hands=self.enable_hands,
+            enable_pose=self.enable_pose,
+            num_hands=self.num_hands,
+            pose_variant=self.pose_variant,
+            hand_model_path=self.hand_model_path,
+            pose_model_path=self.pose_model_path,
+            min_hand_conf=self.min_hand_conf,
+            min_pose_conf=self.min_pose_conf,
+            mirrored_input=self.mirrored_input,
         )
 
     def _ensure_loaded(self) -> None:
@@ -174,7 +203,12 @@ class HandPoseEstimator:
         pose = RawPose(None, None, None, 0.0)
         if self._pose_landmarker is not None:
             pose = _raw_pose(self._pose_landmarker.detect_for_video(mp_image, ts), w, h)
-        return RawEstimate(hands, pose)
+        return RawEstimate(
+            hands,
+            pose,
+            hands_enabled=self._hand_landmarker is not None,
+            pose_enabled=self._pose_landmarker is not None,
+        )
 
     def process(
         self, frame: FramePacket, timestamp_ms: int | None = None
@@ -184,7 +218,9 @@ class HandPoseEstimator:
         ts = timestamp_ms if timestamp_ms is not None else round(frame.t_capture * 1000)
         raw = self.estimate(frame.image, ts)
         fi, t = frame.frame_idx, frame.t_capture
-        hand_set = build_hand_set(fi, t, raw.hands.hands, rotation_used=0)
+        hand_set = build_hand_set(
+            fi, t, raw.hands.hands, rotation_used=0, mirrored_input=self.mirrored_input
+        )
         pose_set = build_pose_set(fi, t, raw.pose, rotation_used=0)
         return hand_set, pose_set
 
@@ -204,11 +240,21 @@ class HandPoseEstimator:
 
 
 def build_hand_set(
-    frame_idx: int, t: float, hands: tuple[RawHand, ...], *, rotation_used: int = 0
+    frame_idx: int,
+    t: float,
+    hands: tuple[RawHand, ...],
+    *,
+    rotation_used: int = 0,
+    mirrored_input: bool = True,
 ) -> HandSet:
+    """``mirrored_input=False`` swaps MediaPipe's selfie-convention label into the operator's own
+    hand. The default keeps the label as reported; estimators pass their own setting."""
     obs = tuple(
         HandObs(
-            side=_side(h.handedness), landmarks_px=h.landmarks_px, landmarks_rack=None, conf=h.score
+            side=_side(h.handedness, swap=not mirrored_input),
+            landmarks_px=h.landmarks_px,
+            landmarks_rack=None,
+            conf=h.score,
         )
         for h in hands
     )
@@ -229,10 +275,12 @@ def build_pose_set(frame_idx: int, t: float, pose: RawPose, *, rotation_used: in
     return PoseSet(frame_idx, t, (obs,))
 
 
-def _side(handedness: str) -> str:
+def _side(handedness: str, *, swap: bool = False) -> str:
     s = handedness.strip().lower()
     if s not in ("left", "right"):
         raise ValueError(f"unexpected MediaPipe handedness {handedness!r}")
+    if swap:
+        return "right" if s == "left" else "left"
     return s
 
 

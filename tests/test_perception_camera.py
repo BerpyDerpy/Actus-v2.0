@@ -131,6 +131,8 @@ def test_live_source_gives_up_after_max_consecutive_failures():
     assert cam.ended.wait(timeout=2.0)
     assert cam.frames_captured == 0
     assert cam.read_failures == 3
+    # A disconnect is surfaced, not mistaken for a clean end of stream.
+    assert isinstance(cam.error, CameraError)
 
 
 def test_open_failure_raises_camera_error():
@@ -142,6 +144,34 @@ def test_open_failure_raises_camera_error():
         raise AssertionError("expected CameraError")
     except CameraError:
         pass
+    # Waiters are woken and the half-open capture is released.
+    assert cam.ended.is_set()
+    assert isinstance(cam.error, CameraError)
+
+
+def test_file_frame_zero_at_zero_ms_keeps_the_container_clock():
+    frames = [_frame(i) for i in range(3)]
+    cap = FakeCapture(frames, msec=[0.0, 33.0, 66.0])
+    cam = Camera("clip.mp4", source_id="test", capture_factory=lambda: cap)
+    bus = Bus()
+    sub = bus.subscribe(Topic.FRAMES, maxsize=10)
+    cam.start(bus)
+    assert cam.ended.wait(timeout=2.0)
+    packets = _drain(sub, 3)
+    assert [p.t_capture for p in packets] == [0.0, 0.033, 0.066]
+    assert cam.clock == "container"
+
+
+def test_live_device_paths_and_pipelines_are_not_files():
+    from actus.capture.camera import _is_file_source
+
+    assert _is_file_source("data/raw/op01_correct_01.mp4")
+    assert _is_file_source("C:/takes/op01_correct_01.mp4")
+    assert not _is_file_source(0)
+    assert not _is_file_source("1")
+    assert not _is_file_source("rtsp://10.0.0.5:8554/live")
+    assert not _is_file_source("/dev/video0")
+    assert not _is_file_source("v4l2src ! videoconvert ! appsink")
 
 
 def test_stop_ends_the_capture_thread_promptly():

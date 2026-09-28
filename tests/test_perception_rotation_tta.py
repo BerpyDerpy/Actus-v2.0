@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from actus.core.contracts import FramePacket
+from actus.perception import rotation_tta as rt
 from actus.perception.handpose import RawEstimate, RawHand, RawHands, RawPose
 from actus.perception.rotation_tta import (
     ROTATIONS,
@@ -155,9 +156,51 @@ def test_landmarks_are_mapped_back_to_the_original_frame():
     tta = OneShot()
     hand_set, _ = tta.process(_blank_frame(w=w, h=h))
     assert tta.rotation_used == 90
-    expected = unrotate_point(5.0, 2.0, w, h, 90)
+    # Landmarks are continuous (pixel i spans [i, i+1)), unrotate_point is pixel-index based.
+    ex, ey = unrotate_point(5.0 - 0.5, 2.0 - 0.5, w, h, 90)
+    expected = (ex + 0.5, ey + 0.5)
     got = hand_set.hands[0].landmarks_px[0]
     assert (float(got[0]), float(got[1])) == pytest.approx(expected, abs=1e-4)
+
+
+def test_continuous_landmarks_on_the_image_edge_map_to_the_opposite_edge():
+    """Image corners on a 90-degree probe must come back as the exact original corners (continuous
+    coordinates), not one pixel short."""
+    w, h = 64, 48
+    # The probe is h wide and w tall. Rotating CCW moves the original top-right corner (w, 0) to
+    # the probe's top-left (0, 0), and the original bottom-left (0, h) to its bottom-right (h, w).
+    pts = np.array([[0.0, 0.0], [float(h), float(w)]], dtype=np.float32)
+    back = rt._unrotate_points(pts, w, h, 90)
+    assert back[0].tolist() == pytest.approx([float(w), 0.0])
+    assert back[1].tolist() == pytest.approx([0.0, float(h)])
+
+
+def test_each_rotation_gets_its_own_estimator():
+    class FakeEstimator:
+        mirrored_input = False
+
+        def __init__(self):
+            self.seen: list[tuple[int, int]] = []
+            self.clones: list[FakeEstimator] = []
+
+        def clone(self):
+            c = FakeEstimator()
+            self.clones.append(c)
+            return c
+
+        def estimate(self, image, ts):
+            self.seen.append(image.shape[:2])
+            return RawEstimate(RawHands(()), RawPose(None, None, None, 0.0))
+
+        def close(self):
+            pass
+
+    est = FakeEstimator()
+    tta = RotationTTA(est, conf_threshold=0.5, every_n_frames=100)  # type: ignore[arg-type]
+    tta.process(_blank_frame(w=64, h=48))  # conf 0 -> full search over all 4 rotations
+    assert est.seen == [(48, 64)]  # the given estimator only ever saw rotation 0
+    assert len(est.clones) == 3
+    assert [c.seen for c in est.clones] == [[(64, 48)], [(48, 64)], [(64, 48)]]
 
 
 def test_rejects_empty_or_invalid_candidates():

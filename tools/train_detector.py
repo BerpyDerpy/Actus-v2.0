@@ -6,12 +6,13 @@
 
 Trains YOLO11n from COCO weights at 640 px with full-360-tolerant augmentation
 (``degrees=180``, left-right flips) and early stopping, once on the real-only dataset and, if
-``--dataset-synth`` is given, once more on real+synthetic. Both runs are evaluated on the
-dataset's ``test`` split (held-out operator(s), never seen in training or validation) and
-exported to ONNX. Whichever run scores higher held-out mAP50 is copied to
-``models/detector/best.pt`` / ``best.onnx`` -- the path ``configs/default.yaml``'s
-``detector.custom_weights`` already points at -- and a model card is written to
-``models/detector/card.md``.
+``--dataset-synth`` (or ``--synthetic-list``, which builds that yaml) is given, once more on
+real+synthetic. Both runs are evaluated on the dataset's ``test`` split (held-out operator(s),
+never seen in training or validation). Whichever run scores higher held-out mAP50 is exported to
+ONNX and copied to ``models/detector/best.pt`` / ``best.onnx`` -- the path
+``configs/default.yaml``'s ``detector.custom_weights`` already points at -- and a model card is
+written to ``models/detector/card.md``. Every number and caveat in the card is computed from this
+run's own data; nothing is carried over from an earlier run.
 
 Ultralytics is imported lazily (this file is only ever run explicitly, but keep it consistent
 with the rest of T-DATA/T-PERC): requires ``uv sync --extra perception``.
@@ -23,6 +24,7 @@ import argparse
 import json
 import shutil
 import sys
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,12 +40,43 @@ if str(REPO_ROOT) not in sys.path:
 from tools._datalib import (  # noqa: E402
     CLASSES,
     Box,
+    parse_take_stem,
     read_classes,
     read_manifest,
+    read_reviewed,
     read_yolo_label,
     rel_to_repo,
     to_repo_path,
 )
+
+
+def label_path_for(img_path: Path) -> Path:
+    """The YOLO label file for an image: the last ``images`` directory in the path swapped for
+    ``labels``, extension ``.txt``. Works on path parts, so Windows backslash paths work too."""
+    parts = list(img_path.parts)
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i] == "images":
+            parts[i] = "labels"
+            break
+    return Path(*parts).with_suffix(".txt")
+
+
+def _dataset_names(dataset: dict, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    """Class names in id order from a dataset yaml (a list or an ``{id: name}`` mapping)."""
+    names = dataset.get("names")
+    if isinstance(names, dict):
+        return tuple(names[k] for k in sorted(names, key=int))
+    if isinstance(names, list) and names:
+        return tuple(names)
+    return fallback
+
+
+def _operator_of(image_rel: str) -> str | None:
+    """The operator of a frame, from its take directory (``.../<take>/frame_NNNNNN.jpg``)."""
+    try:
+        return parse_take_stem(Path(image_rel).parent.name)["operator"]
+    except ValueError:
+        return None
 
 # --------------------------------------------------------------------------------------------
 # Label prep: a hybrid autolabel proposer, tuned on this footage
@@ -140,17 +173,46 @@ def relabel(
     manifest_path: Path, out_dir: Path, *, exclude_operators: tuple[str, ...] = ("op01",)
 ) -> dict:
     """Regenerate ``data/labels`` with :class:`HybridProposer`, dropping any manifest rows from
-    ``exclude_operators`` (non-conforming footage) rather than labeling them wrong."""
+    ``exclude_operators`` (non-conforming footage) rather than labeling them wrong. Their old
+    label files are deleted too; ``drop_operators_from_splits`` takes them out of the split
+    lists, so "excluded" means excluded from training, not just from relabelling."""
     from actus.core.config import load_config
     from tools.autolabel import YoloWorldProposer, autolabel_manifest
 
-    rows = [r for r in read_manifest(manifest_path) if r["operator"] not in exclude_operators]
+    all_rows = read_manifest(manifest_path)
+    for r in all_rows:
+        if r["operator"] in exclude_operators:
+            stale = out_dir / r["take"] / f"frame_{int(r['frame_idx']):06d}.txt"
+            stale.unlink(missing_ok=True)
+    rows = [r for r in all_rows if r["operator"] not in exclude_operators]
     cfg = load_config()
     world_prompts = {c: cfg.detector.prompts[c] for c in CLASSES if c not in _COLOR_RANGES}
     proposer = HybridProposer(
         YoloWorldProposer(world_prompts, classes=tuple(world_prompts)), ColorBoxProposer()
     )
     return autolabel_manifest(rows, proposer, out_dir, min_conf=0.0)
+
+
+def drop_operators_from_splits(dataset_yaml: Path, exclude_operators: tuple[str, ...]) -> int:
+    """Remove the excluded operators' frames from the dataset's train/val/test lists. Returns
+    how many lines were dropped."""
+    if not exclude_operators:
+        return 0
+    dataset = yaml.safe_load(dataset_yaml.read_text(encoding="utf-8"))
+    root = Path(dataset["path"])
+    dropped = 0
+    for key in ("train", "val", "test"):
+        if not dataset.get(key):
+            continue
+        split = root / dataset[key]
+        if not split.exists():
+            continue
+        lines = [ln for ln in split.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        kept = [ln for ln in lines if _operator_of(ln) not in exclude_operators]
+        if len(kept) != len(lines):
+            dropped += len(lines) - len(kept)
+            split.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    return dropped
 
 
 # --------------------------------------------------------------------------------------------
@@ -293,14 +355,9 @@ def run_training(
 
     run_dir = project / name
     weights_pt = run_dir / "weights" / "best.pt"
-    n_train = len(
-        (
-            Path(yaml.safe_load(dataset_yaml.read_text())["path"])
-            / yaml.safe_load(dataset_yaml.read_text())["train"]
-        )
-        .read_text()
-        .splitlines()
-    )
+    dataset = yaml.safe_load(dataset_yaml.read_text(encoding="utf-8"))
+    train_list = Path(dataset["path"]) / dataset["train"]
+    n_train = sum(1 for ln in train_list.read_text(encoding="utf-8").splitlines() if ln.strip())
     epochs_run = _epochs_actually_run(run_dir)
 
     (run_dir / "held_out_eval.json").write_text(
@@ -333,9 +390,10 @@ def _epochs_actually_run(run_dir: Path) -> int:
 
 
 def full_image_box_baseline(dataset_yaml: Path, *, classes: tuple[str, ...]) -> dict:
-    """Every test image gets one full-frame box per class present anywhere in the test split's
-    ground truth -- a floor any trained model must clear by a wide margin, since it never
-    localizes anything."""
+    """Every test image gets one full-frame box per class present in its ground truth, and the
+    mean IoU of that box against the ground truth is reported. It is a *localization* reference
+    (how much overlap comes for free from knowing what is in frame), not an mAP: the two are on
+    different scales and must not be compared as numbers."""
     dataset = yaml.safe_load(dataset_yaml.read_text(encoding="utf-8"))
     repo_path = Path(dataset["path"])
     test_list = repo_path / dataset["test"]
@@ -345,17 +403,16 @@ def full_image_box_baseline(dataset_yaml: Path, *, classes: tuple[str, ...]) -> 
     if not image_paths:
         return {"map50": None, "note": "test split is empty"}
 
-    tp_iou_sum, n_gt, n_pred = 0.0, 0, 0
+    tp_iou_sum, n_gt = 0.0, 0
     for rel in image_paths:
         img_path = repo_path / rel
-        label_path = Path(str(img_path).replace("/images/", "/labels/")).with_suffix(".txt")
+        label_path = label_path_for(img_path)
         img = cv2.imread(str(img_path))
         if img is None:
             continue
         h, w = img.shape[:2]
         gt = read_yolo_label(label_path, w, h, classes)
         n_gt += len(gt)
-        n_pred += len({b.cls for b in gt})  # one full-frame box per class present
         for b in gt:
             area_gt = (b.x2 - b.x1) * (b.y2 - b.y1)
             tp_iou_sum += area_gt / (w * h)  # IoU of a full-frame box against a smaller GT box
@@ -396,10 +453,10 @@ def _iou(a: Box, b: Box) -> float:
 
 def _score_frame(gt: list[Box], pred: list[Box], iou_thresh: float = 0.5) -> tuple[int, int]:
     """(false_negatives, false_positives) of ``pred`` against ``gt`` via greedy same-class
-    IoU matching."""
+    IoU matching, highest-confidence prediction first (as mAP matching does)."""
     unmatched_gt = list(gt)
     fp = 0
-    for p in pred:
+    for p in sorted(pred, key=lambda b: b.conf, reverse=True):
         best_i, best_iou = None, 0.0
         for i, g in enumerate(unmatched_gt):
             if g.cls != p.cls:
@@ -443,36 +500,47 @@ def build_failure_gallery(
     repo_path = Path(dataset["path"])
     test_list = repo_path / dataset["test"]
     image_paths = [ln for ln in test_list.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    # Label ids index the names the model was trained with (the dataset yaml), not whatever
+    # classes.txt says now.
+    gt_names = _dataset_names(dataset, classes)
 
+    # Keep only the scores and the (small) box lists; images are re-read for the n shown, so a
+    # large test split never has to fit in RAM.
     scored = []
     for rel in image_paths:
         img_path = repo_path / rel
-        label_path = Path(str(img_path).replace("/images/", "/labels/")).with_suffix(".txt")
         img = cv2.imread(str(img_path))
         if img is None:
             continue
         h, w = img.shape[:2]
-        gt = read_yolo_label(label_path, w, h, classes)
+        gt = read_yolo_label(label_path_for(img_path), w, h, gt_names)
         result = model.predict(img, conf=conf, imgsz=imgsz, verbose=False)[0]
+        pred_names = getattr(result, "names", None) or dict(enumerate(gt_names))
         pred = []
         if result.boxes is not None:
             for box in result.boxes:
                 x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
-                cls_name = classes[int(box.cls.item())]
+                cls_name = pred_names[int(box.cls.item())]
                 pred.append(Box(cls_name, x1, y1, x2, y2, float(box.conf.item())))
         fn, fp = _score_frame(gt, pred)
-        scored.append((fn + fp, fn, fp, rel, img, gt, pred))
+        scored.append((fn + fp, fn, fp, rel, gt, pred))
+        del img
 
     scored.sort(key=lambda t: t[0], reverse=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("*.jpg"):  # a previous run's gallery must not linger
+        old.unlink()
     gallery = []
-    for badness, fn, fp, rel, img, gt, pred in scored[:n]:
+    for rank, (badness, fn, fp, rel, gt, pred) in enumerate(scored[:n], 1):
         if badness == 0:
             break  # every remaining frame is perfect; nothing left to show honestly as a failure
+        img = cv2.imread(str(repo_path / rel))
+        if img is None:
+            continue
         overlay = _draw_boxes(img, gt, dashed=False)
         overlay = _draw_boxes(overlay, pred, dashed=True)
-        stem = Path(rel).stem
-        out_path = out_dir / f"{stem}.jpg"
+        # frame_NNNNNN repeats across takes: prefix the rank and the take directory.
+        out_path = out_dir / f"{rank:02d}_{Path(rel).parent.name}_{Path(rel).stem}.jpg"
         cv2.imwrite(str(out_path), overlay)
         gallery.append(
             {
@@ -501,7 +569,11 @@ def write_card(
     gallery: list[dict],
     base_weights: str,
     train_args: dict,
+    excluded_operators: tuple[str, ...] = (),
+    review: dict | None = None,
 ) -> None:
+    """``review`` is ``{"reviewed": n, "total": m}`` (frames accepted in review_labels.py), or
+    None if unknown. Every statement below is derived from these arguments."""
     lines = ["# ACTUS custom detector (YOLO11n) — model card", ""]
     lines += [
         "Trained by `tools/train_detector.py` (T-DET-TRAIN) from COCO weights on the project's "
@@ -584,14 +656,15 @@ def write_card(
                 f"{m['mAP50-95']:.3f} |"
             )
 
-    lines += ["", "## Baseline", ""]
+    lines += ["", "## Localization reference", ""]
     if baseline.get("map50") is None and "mean_iou_of_full_frame_box_vs_gt" in baseline:
         lines.append(
             'A full-frame "detector" (one box covering the whole image per class known to be '
             f"present) gets a mean IoU of {baseline['mean_iou_of_full_frame_box_vs_gt']:.3f} "
-            f"against the {baseline['n_gt_boxes']} held-out ground-truth boxes — it never "
-            "localizes anything, so any real mAP50 above that is the model actually learning "
-            "to localize, not just learning what's usually in frame."
+            f"against the {baseline['n_gt_boxes']} held-out ground-truth boxes. It never "
+            "localizes anything. This IoU is **not** on the mAP scale and is not a floor for "
+            "the mAP50 above; it only shows how large the objects are relative to the frame "
+            "(a high value would mean even a trivial box overlaps them a lot)."
         )
     lines.append("")
 
@@ -603,8 +676,9 @@ def write_card(
         )
         lines.append("")
         for g in gallery:
+            link = Path(os.path.relpath(to_repo_path(g["image"]), path.parent)).as_posix()
             lines.append(
-                f"![{g['source']}]({Path(g['image']).relative_to('models/detector').as_posix()}) "
+                f"![{g['source']}]({link}) "
                 f"— {g['false_negatives']} missed, {g['false_positives']} spurious "
                 f"(`{g['source']}`)"
             )
@@ -613,46 +687,63 @@ def write_card(
         lines.append("No failures in the held-out set above the matching IoU threshold.")
         lines.append("")
 
-    lines += [
-        "## Honest limitations",
-        "",
-        "- Autolabel proposals (YOLO-World open-vocabulary boxes) were used as training labels. "
-        "**No human reviewed them box-by-box** in this run — `tools/review_labels.py` supports "
-        "that workflow but it needs a human at a display; running it here would only fake a "
-        "review, which `CLAUDE.md` explicitly rules out. Treat these labels as weak/noisy, not "
-        "verified.",
-        "- The held-out test operator's footage is all `correct`-scenario takes (see `data/"
-        "splits/report.md`); it does not by itself test the detector on out-of-order or skip "
-        "footage, only on the box/lid appearances themselves.",
-        "- Training data is small (single room, one rack, fixed lighting setup); this is not "
-        "evidence the detector generalizes beyond the filmed environment.",
-        "- **Prop colors are not consistent across operators.** `red_box`/`yellow_box` are "
-        "proposed by an HSV color heuristic (see the module docstring), tuned against op02's "
-        "and op03's actual red/yellow props. op05 (the held-out test operator) used an orange "
-        'object as its "yellow box" stand-in rather than yellow, which falls outside the '
-        "tuned hue range: the held-out test split ends up with **zero** yellow_box ground-truth "
-        "instances, so that class's held-out performance is simply unmeasured here, not passing "
-        "or failing. Widening the hue range to catch orange was rejected because it starts "
-        "matching the cardboard box's own tan/brown color instead (see the calibration in the "
-        "PR description).",
-        "- **outer_box_closed is rare in held-out footage** (13 ground-truth boxes in the whole "
-        "test split, vs. 2559 in train): the protocol only has the box closed briefly at the "
-        "very start and end of a take. Its near-zero held-out mAP50 (0.007) mostly reflects "
-        "that scarcity, not a specific failure mode -- the model essentially never gets to "
-        'practice recognizing "closed" in this operator\'s footage.',
-        "- One operator (op01, 3 takes) used an entirely different, non-conforming prop set (a "
-        "mug, a thermos and a book instead of the boxes) and was **excluded from the detector "
-        "dataset entirely** (`--relabel --exclude-operators op01`) rather than mislabeled; see "
-        "the module docstring.",
-        "- Real+synthetic training scored *lower* held-out mAP50 than real-only (0.221 vs. "
-        "0.415) -- the deployed model is the real-only run. The synthetic images (copy-pasted "
-        "crops on NASA ISS/clean-room photos) look quite different from this project's own "
-        "carpeted-room footage; with only ~1100 real frames feeding the crops and 1200 "
-        "synthetic images added on top, synthetic data seems to have diluted the real signal "
-        "rather than adding useful variety. This is reported as-is, not tuned away.",
-        "",
-    ]
+    lines += ["## Honest limitations", ""]
+    # Every bullet is computed from this run's inputs. Observations about one particular run
+    # (which prop an operator used, why a class scored low) belong in Vault notes, not here.
+    if review is None:
+        lines.append(
+            "- The training labels are autolabel proposals; no review status file was found, so "
+            "treat them as weak/noisy, not verified."
+        )
+    elif review["reviewed"] < review["total"]:
+        lines.append(
+            f"- Only {review['reviewed']} of {review['total']} labelled frames were accepted by a "
+            "human in `tools/review_labels.py`; the rest are unreviewed autolabel proposals. "
+            "Treat those labels as weak/noisy, not verified."
+        )
+    else:
+        lines.append(
+            f"- All {review['total']} labelled frames were accepted by a human in "
+            "`tools/review_labels.py`."
+        )
+    unmeasured = sorted(c for c, m in chosen.per_class.items() if m.get("mAP50") is None)
+    if unmeasured:
+        lines.append(
+            f"- No held-out ground truth for: {', '.join(f'`{c}`' for c in unmeasured)}. Their "
+            "held-out performance is unmeasured, neither passing nor failing."
+        )
+    lines.append(
+        "- Held-out numbers are for held-out *operators* in the filmed environment; see "
+        "`data/splits/report.md` for which scenarios they performed. They are not evidence the "
+        "detector generalizes beyond that environment."
+    )
+    if excluded_operators:
+        lines.append(
+            f"- Operator(s) {', '.join(f'`{o}`' for o in excluded_operators)} were **excluded "
+            "from the detector dataset** (`--relabel --exclude-operators`): their labels were "
+            "deleted and their frames removed from the split lists, rather than mislabeled."
+        )
+    if synth_result is not None:
+        better = synth_result.map50 > real_result.map50
+        lines.append(
+            f"- Real+synthetic held-out mAP50 {synth_result.map50:.3f} vs. real-only "
+            f"{real_result.map50:.3f}: synthetic data "
+            + ("helped" if better else "did not help")
+            + f" in this run, so the deployed model is `{chosen.name}`. Reported as-is."
+        )
+    lines.append("")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _review_counts(
+    labels_dir: Path, manifest_path: Path, excluded: tuple[str, ...]
+) -> dict | None:
+    """How many of the dataset's frames a human accepted, for the card; None if unknown."""
+    reviewed = read_reviewed(labels_dir / "review_status.csv")
+    if reviewed is None or not manifest_path.exists():
+        return None
+    rows = [r for r in read_manifest(manifest_path) if r["operator"] not in excluded]
+    return {"reviewed": sum(1 for r in rows if r["image_path"] in reviewed), "total": len(rows)}
 
 
 # --------------------------------------------------------------------------------------------
@@ -664,6 +755,11 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dataset", default="data/dataset.yaml")
     ap.add_argument("--dataset-synth", help="dataset yaml for the real+synthetic run (optional)")
+    ap.add_argument(
+        "--synthetic-list",
+        help="data/splits/synthetic.txt: build the real+synthetic dataset yaml from it "
+        "(ignored if --dataset-synth is given)",
+    )
     ap.add_argument("--splits-report", default="data/splits/report.json")
     ap.add_argument("--base-weights", default="yolo11n.pt")
     ap.add_argument("--epochs", type=int, default=150)
@@ -697,17 +793,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
+    dataset_yaml = to_repo_path(args.dataset)
+    excluded: tuple[str, ...] = ()
     if args.relabel:
-        exclude = tuple(o for o in args.exclude_operators.split(",") if o)
+        excluded = tuple(o for o in args.exclude_operators.split(",") if o)
         report = relabel(
             to_repo_path(args.relabel_manifest),
             to_repo_path("data/labels"),
-            exclude_operators=exclude,
+            exclude_operators=excluded,
         )
-        print(f"relabelled {report['n_frames']} frames (excluded operators: {exclude})")
+        print(f"relabelled {report['n_frames']} frames (excluded operators: {excluded})")
         print(f"per-class counts: {report['per_class_count']}")
+        dropped = drop_operators_from_splits(dataset_yaml, excluded)
+        print(f"removed {dropped} frames of {excluded} from the split lists")
+        if dropped and (args.dataset_synth or args.synthetic_list):
+            print(
+                "WARNING: the synthetic set was built from the old labels; rerun "
+                "synth_augment.py so it no longer contains the excluded operators' crops"
+            )
 
-    dataset_yaml = to_repo_path(args.dataset)
     splits_report = json.loads(to_repo_path(args.splits_report).read_text(encoding="utf-8"))
     project = to_repo_path(args.project)
     out_dir = to_repo_path(args.out_dir)
@@ -739,8 +843,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"real-only held-out mAP50={real_result.map50:.4f} mAP50-95={real_result.map50_95:.4f}")
 
     synth_result = None
-    if args.dataset_synth:
-        synth_yaml = to_repo_path(args.dataset_synth)
+    synth_yaml_arg = args.dataset_synth
+    if not synth_yaml_arg and args.synthetic_list:
+        synth_yaml_arg = str(
+            build_synth_dataset_yaml(
+                dataset_yaml,
+                to_repo_path(args.synthetic_list),
+                dataset_yaml.with_name(dataset_yaml.stem + "_synth.yaml"),
+            )
+        )
+    if synth_yaml_arg:
+        synth_yaml = to_repo_path(synth_yaml_arg)
         print(f"=== training real+synthetic: {synth_yaml} ===")
         synth_result = run_training(synth_yaml, name=args.synth_run_name, **train_kwargs)
         print(
@@ -789,6 +902,8 @@ def main(argv: list[str] | None = None) -> int:
             "fliplr": args.fliplr,
             "patience": args.patience,
         },
+        excluded_operators=excluded,
+        review=_review_counts(labels_dir, to_repo_path(args.relabel_manifest), excluded),
     )
 
     summary = {

@@ -79,6 +79,19 @@ def test_autolabel_manifest_min_conf_filters_proposals(tmp_path):
     assert label_path.read_text(encoding="utf-8") == ""
 
 
+def test_autolabel_manifest_never_overwrites_reviewed_frames(tmp_path):
+    rows = _make_frames(tmp_path, 2)
+    out_dir = tmp_path / "labels"
+    reviewed = rows[0]
+    label_path = out_dir / reviewed["take"] / f"frame_{int(reviewed['frame_idx']):06d}.txt"
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.write_text("4 0.5 0.5 0.1 0.1\n", encoding="utf-8")  # a human's correction
+
+    report = autolabel_manifest(rows, _fake_propose, out_dir, skip={reviewed["image_path"]})
+    assert label_path.read_text(encoding="utf-8") == "4 0.5 0.5 0.1 0.1\n"
+    assert report["n_frames_skipped_reviewed"] == 1
+
+
 def test_autolabel_manifest_missing_image_raises(tmp_path):
     rows = _make_frames(tmp_path, 1)
     rows[0]["image_path"] = str(tmp_path / "nope.jpg")

@@ -108,6 +108,41 @@ def test_score_frame_counts_missed_and_spurious():
     assert fp == 1  # lid predicted but not in gt
 
 
+def test_score_frame_lets_the_most_confident_prediction_match_first():
+    gt = [Box("red_box", 0, 0, 10, 10), Box("red_box", 4, 0, 14, 10)]
+    weak = Box("red_box", 2, 0, 12, 10, 0.3)  # IoU 0.67 with both; listed first by the model
+    strong = Box("red_box", 0, 0, 10, 10, 0.9)  # IoU 1.0 with the first, 0.43 with the second
+    # The strong box takes the first GT and the weak one the second: a perfect frame. Matching
+    # in list order would give the first GT to the weak box and leave (1 missed, 1 spurious).
+    assert _score_frame(gt, [weak, strong]) == (0, 0)
+
+
+def test_label_path_for_swaps_the_images_directory_on_any_os():
+    from tools.train_detector import label_path_for
+
+    img = Path("D:/repo") / "data" / "images" / "op02_correct_01" / "frame_000120.jpg"
+    assert label_path_for(img) == (
+        Path("D:/repo") / "data" / "labels" / "op02_correct_01" / "frame_000120.txt"
+    )
+
+
+def test_drop_operators_from_splits_removes_excluded_frames(tmp_path):
+    from tools.train_detector import drop_operators_from_splits
+
+    (tmp_path / "splits").mkdir()
+    (tmp_path / "splits" / "train.txt").write_text(
+        "images/op01_correct_01/frame_000000.jpg\nimages/op02_correct_01/frame_000000.jpg\n",
+        encoding="utf-8",
+    )
+    dataset_yaml = tmp_path / "dataset.yaml"
+    dataset_yaml.write_text(
+        yaml.safe_dump({"path": str(tmp_path), "train": "splits/train.txt"}), encoding="utf-8"
+    )
+    assert drop_operators_from_splits(dataset_yaml, ("op01",)) == 1
+    lines = (tmp_path / "splits" / "train.txt").read_text(encoding="utf-8").splitlines()
+    assert lines == ["images/op02_correct_01/frame_000000.jpg"]
+
+
 def test_score_frame_wrong_class_at_same_location_is_both_fn_and_fp():
     gt = [Box("red_box", 0, 0, 10, 10)]
     pred = [Box("yellow_box", 0, 0, 10, 10, 0.9)]
@@ -246,3 +281,42 @@ def test_write_card_interpolates_every_field(tmp_path):
     assert "fliplr=0.5" in text
     assert "degrees=180.0" in text
     assert "0.5000" in text  # the real run's mAP50
+
+
+def test_write_card_has_no_numbers_from_an_earlier_run_and_links_relative(tmp_path):
+    split_report = {
+        "operators": {"op02": "train", "op05": "test"},
+        "per_split_frames": {"train": 100, "val": 0, "test": 20},
+        "per_split_takes": {"train": 5, "val": 0, "test": 2},
+        "leakage_checks": [],
+        "duration_warnings": [],
+    }
+    real = _fake_run("real", 0.5)
+    real.per_class["lid"] = {"precision": None, "recall": None, "mAP50": None, "mAP50-95": None}
+    out_dir = tmp_path / "detector_v2"  # not models/detector
+    (out_dir / "failures").mkdir(parents=True)
+    card_path = out_dir / "card.md"
+    write_card(
+        card_path,
+        split_report=split_report,
+        real_result=real,
+        synth_result=None,
+        chosen=real,
+        baseline={"map50": None},
+        gallery=[
+            {
+                "image": str(out_dir / "failures" / "01_op05_correct_01_frame_000001.jpg"),
+                "source": "images/op05_correct_01/frame_000001.jpg",
+                "false_negatives": 1,
+                "false_positives": 0,
+            }
+        ],
+        base_weights="yolo11n.pt",
+        train_args={"imgsz": 640, "batch": 16, "degrees": 180.0, "fliplr": 0.5, "patience": 15},
+        review={"reviewed": 40, "total": 120},
+    )
+    text = card_path.read_text(encoding="utf-8")
+    assert "(failures/01_op05_correct_01_frame_000001.jpg)" in text
+    for stale in ("0.221", "0.415", "2559", "0.007", "op01"):
+        assert stale not in text
+    assert "40 of 120" in text and "`lid`" in text

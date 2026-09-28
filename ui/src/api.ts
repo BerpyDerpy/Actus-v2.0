@@ -36,19 +36,35 @@ export const api = {
     return resp.ok;
   },
 
-  // 404 (or a network error) when the pipeline runs without fault injection: no controls shown.
-  async faults(): Promise<FaultsState | null> {
+  // "absent" on a 404 (the pipeline runs without fault injection; that never changes while the
+  // server is up), null on a network error (try again later): no controls shown either way.
+  async faults(): Promise<FaultsState | "absent" | null> {
     try {
       const resp = await fetch("/api/faults");
+      if (resp.status === 404) return "absent";
       if (!resp.ok) return null;
       return (await resp.json()) as FaultsState;
     } catch {
       return null;
     }
   },
-  async setFault(name: string, on?: boolean): Promise<boolean> {
-    const query = on === undefined ? "" : `?on=${on}`;
-    const resp = await fetch(`/api/faults/${encodeURIComponent(name)}${query}`, { method: "POST" });
-    return resp.ok;
+  // Never rejects: a network error or an HTTP error comes back as { ok: false, error }.
+  async setFault(name: string, on: boolean): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const resp = await fetch(`/api/faults/${encodeURIComponent(name)}?on=${on}`, {
+        method: "POST",
+      });
+      if (resp.ok) return { ok: true };
+      let detail = `HTTP ${resp.status}`;
+      try {
+        const body = (await resp.json()) as { detail?: unknown };
+        if (body.detail !== undefined) detail = String(body.detail);
+      } catch {
+        // not JSON; keep the status line
+      }
+      return { ok: false, error: detail };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
   },
 };

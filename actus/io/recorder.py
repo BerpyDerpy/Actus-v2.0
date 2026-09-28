@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,9 +66,27 @@ class SegmentWriter:
         self._seg_start_t: float | None = None
         self._size: tuple[int, int] | None = None
         self.segments: list[SegmentInfo] = []
-        self.errors: list[str] = []
+        self.errors: list[str] = []  # the most recent errors (capped); error_count has them all
+        self.error_count = 0
+        self.frames_dropped = 0  # frames skipped while a failed writer is backing off
+        self.retry_s = 5.0
+        self._retry_after: float | None = None
+
+    def note_error(self, msg: str) -> None:
+        self.error_count += 1
+        self.errors.append(msg)
+        if len(self.errors) > 50:
+            del self.errors[:-50]
 
     def write(self, frame: FramePacket) -> None:
+        if (
+            self._writer is None
+            and self._retry_after is not None
+            and time.monotonic() < self._retry_after
+        ):
+            # The last open failed (codec missing, disk full): don't retry on every frame.
+            self.frames_dropped += 1
+            return
         img = frame.image
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -87,15 +106,19 @@ class SegmentWriter:
 
     def _roll(self, w: int, h: int, frame: FramePacket) -> None:
         self._close_segment()
-        self._seg_idx += 1
-        self._size = (w, h)
-        self._seg_start_t = frame.t_capture
-        stem = f"{self.stream_name}_{self._seg_idx:03d}"
+        seg_idx = self._seg_idx + 1  # committed only once the writer opens
+        stem = f"{self.stream_name}_{seg_idx:03d}"
         path = self.out_dir / f"{stem}.mp4"
         sidecar = self.out_dir / f"{stem}.frames.csv"
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*self.codec), self.fps, (w, h))
         if not writer.isOpened():
+            writer.release()
+            self._retry_after = time.monotonic() + self.retry_s
             raise RuntimeError(f"could not open a {self.codec!r} writer for {path}")
+        self._retry_after = None
+        self._seg_idx = seg_idx
+        self._size = (w, h)
+        self._seg_start_t = frame.t_capture
         self._writer = writer
         # kept open across many write() calls, so a `with` block doesn't fit here.
         self._sidecar_f = open(sidecar, "w", newline="", encoding="utf-8")  # noqa: SIM115
@@ -180,8 +203,8 @@ class Recorder:
                 continue
             try:
                 stream.writer.write(env.payload)
-            except (RuntimeError, ValueError, cv2.error) as e:
-                stream.writer.errors.append(str(e))
+            except (RuntimeError, ValueError, OSError, cv2.error) as e:
+                stream.writer.note_error(str(e))
 
     def stop(self, timeout: float = 3.0) -> None:
         self._stop.set()
@@ -198,7 +221,9 @@ class Recorder:
             name: {
                 "segments": len(s.writer.segments),
                 "frames_written": sum(seg.frames_written for seg in s.writer.segments),
-                "errors": len(s.writer.errors),
+                "frames_dropped": s.writer.frames_dropped,
+                "errors": s.writer.error_count,
+                "last_error": s.writer.errors[-1] if s.writer.errors else None,
             }
             for name, s in self._streams.items()
         }

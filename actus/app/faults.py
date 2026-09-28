@@ -243,6 +243,7 @@ class _Occlude(_Fault):
         self.max_covered = float(self.params["max_covered"])
         if not 0.0 < self.max_covered <= 1.0:
             raise ValueError(f"max_covered must be in (0, 1], got {self.max_covered!r}")
+        self._tile: np.ndarray | None = None
 
     def apply(self, w: _Work) -> None:
         h, wd = w.img.shape[:2]
@@ -250,12 +251,16 @@ class _Occlude(_Fault):
         box = (round(x0 * wd), round(y0 * h), round(x1 * wd), round(y1 * h))
         img = w.img.copy()
         patch = img[box[1] : box[3], box[0] : box[2]]  # a view into img
-        # A covered lens is dark, not bit-identical from frame to frame: seeded sensor noise keeps
-        # a blackout from looking like a frozen camera to the stale-frame guard, and keeps a
-        # replay deterministic.
-        patch[...] = np.random.default_rng(w.frame_idx).integers(
-            0, 4, size=patch.shape, dtype=np.uint8
-        )
+        # A covered lens is dark, not bit-identical from frame to frame: sensor noise keeps a
+        # blackout from looking like a frozen camera to the stale-frame guard (which compares
+        # consecutive frames). The noise tile is drawn once (seeded, so a replay stays
+        # deterministic); stamping frame_idx % 4 into one pixel makes consecutive frames differ
+        # without a fresh full-frame RNG draw per frame.
+        if self._tile is None or self._tile.shape != patch.shape:
+            self._tile = np.random.default_rng(0).integers(0, 4, size=patch.shape, dtype=np.uint8)
+        patch[...] = self._tile
+        if patch.size:
+            patch[0, 0] = w.frame_idx % 4
         w.img = img
         if w.dets is not None and w.had_dets:  # what a real detector could no longer see
             kept = [d for d in w.dets.detections if _covered(d.bbox_xyxy, box) < self.max_covered]
@@ -448,9 +453,26 @@ class SimulatedTarget:
 
 def _parse_value(text: str) -> Any:
     text = text.strip()
-    if "," in text:
-        return [float(x) for x in text.split(",")]
-    return yaml.safe_load(text)
+    try:
+        if "," in text:
+            return [float(x) for x in text.split(",")]
+        value = yaml.safe_load(text)
+    except (ValueError, yaml.YAMLError) as e:
+        raise ValueError(f"bad fault parameter value {text!r}") from e
+    if value is None:
+        raise ValueError("empty fault parameter value (omit the key to use its default)")
+    return value
+
+
+def _format_value(v: Any) -> str:
+    """The inverse of ``_parse_value``: lists as ``a,b,c``, numbers with ``:g``."""
+    if isinstance(v, (list, tuple)):
+        return ",".join(_format_value(x) for x in v)
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
 
 
 @dataclass(frozen=True)
@@ -468,8 +490,10 @@ class ScheduledFault:
         return self.start <= x < self.end
 
     def spec(self) -> str:
+        """A string ``parse_schedule_item`` reads back. ``None`` params (= the default) are
+        left out, since the schedule syntax has no way to say "default"."""
         end = "end" if math.isinf(self.end) else f"{self.end:g}"
-        prm = ";".join(f"{k}={v}" for k, v in self.params.items())
+        prm = ";".join(f"{k}={_format_value(v)}" for k, v in self.params.items() if v is not None)
         return f"{self.name}@{'f' if self.unit == 'f' else ''}{self.start:g}-{end}" + (
             f":{prm}" if prm else ""
         )
@@ -499,9 +523,34 @@ def parse_schedule_item(spec: str, *, detector_conf: float = 0.25) -> ScheduledF
         key, eq, raw = item.partition("=")
         if not eq or not key.strip():
             raise ValueError(f"fault schedule {spec!r}: parameter must be key=value, got {item!r}")
-        params[key.strip()] = _parse_value(raw)
-    build_fault(name, params, detector_conf=detector_conf)  # validates name and params
+        try:
+            params[key.strip()] = _parse_value(raw)
+        except ValueError as e:
+            raise ValueError(f"fault schedule {spec!r}: {e}") from e
+    _validate(name, params, detector_conf=detector_conf)
     return ScheduledFault(name, start, end, unit, params)
+
+
+def _validate(name: str, params: Mapping[str, Any], *, detector_conf: float = 0.25) -> None:
+    """``build_fault`` as a check: ``KeyError`` for an unknown fault, ``ValueError`` for any bad
+    parameter (a wrongly typed value included, which would otherwise surface as a TypeError)."""
+    try:
+        build_fault(name, params, detector_conf=detector_conf)
+    except TypeError as e:
+        raise ValueError(f"fault {name!r}: bad parameter type ({e})") from e
+
+
+def _check_scheduled(
+    s: ScheduledFault, defaults: Mapping[str, Any], *, detector_conf: float
+) -> ScheduledFault:
+    """Validate a ready-made ``ScheduledFault`` as strictly as a parsed one, at construction
+    time rather than in the middle of a run."""
+    if s.unit not in ("s", "f"):
+        raise ValueError(f"fault schedule {s!r}: unit must be 's' or 'f'")
+    if not s.end > s.start >= 0.0:
+        raise ValueError(f"fault schedule {s!r}: need 0 <= start < end")
+    _validate(s.name, {**defaults, **dict(s.params)}, detector_conf=detector_conf)
+    return s
 
 
 # --------------------------------------------------------------------------------------------
@@ -576,17 +625,17 @@ class FaultController:
         detector_conf: float = 0.25,
     ) -> None:
         self.detector_conf = float(detector_conf)
-        self.schedule: tuple[ScheduledFault, ...] = tuple(
-            s
-            if isinstance(s, ScheduledFault)
-            else parse_schedule_item(s, detector_conf=detector_conf)
-            for s in schedule
-        )
         self.defaults: dict[str, dict[str, Any]] = {n: {} for n in FAULTS}
         for name, params in (defaults or {}).items():
             if name in FAULTS:
                 self.defaults[name] = dict(params or {})
-                build_fault(name, self.defaults[name], detector_conf=detector_conf)
+                _validate(name, self.defaults[name], detector_conf=detector_conf)
+        self.schedule: tuple[ScheduledFault, ...] = tuple(
+            _check_scheduled(s, self.defaults.get(s.name, {}), detector_conf=detector_conf)
+            if isinstance(s, ScheduledFault)
+            else parse_schedule_item(s, detector_conf=detector_conf)
+            for s in schedule
+        )
         self._guard = StaleFrameGuard(stale_after) if stale_after > 0 else None
         self._lock = threading.RLock()
         self._pending: list[tuple[str, bool | None, dict[str, Any]]] = []
@@ -613,7 +662,35 @@ class FaultController:
         self._target: StreamTarget | None = None
         self._net_state = "n/a"
         self._net_error: str | None = None
+        self._net_failed: str | None = None  # set by the network worker when a cut fails
         self._pool: ThreadPoolExecutor | None = None
+
+    def reset(self) -> None:
+        """Forget the previous run: records, windows, overrides, the stale guard and the clock
+        origin. ``attach`` calls it when the controller is attached to a new core, so reusing one
+        controller for a second run never carries the first run's state into it."""
+        with self._lock:
+            self._pending = []
+            self._manual = {}
+            self._manual_params = {}
+            self._active = {}
+            self._window_of = {}
+            self._windows = []
+            self._records = []
+            self._refused = {}
+            self._stale = False
+            self._added = set()
+            self._my_tags = set()
+            self._prev_img = None
+            self._prev_dets = None
+            self._t0 = None
+            self._fi0 = 0
+            self._last_fi = None
+            self._last_t = None
+            self._log = None
+            self._net_failed = None
+            if self._guard is not None:
+                self._guard.reset()
 
     @classmethod
     def from_config(cls, cfg: Config, *, schedule: Iterable[ScheduledFault | str] = ()):
@@ -631,7 +708,10 @@ class FaultController:
     # -- wiring -------------------------------------------------------------------------------
 
     def attach(self, core) -> FaultController:
-        """Install as a source hook on a ``PipelineCore`` (idempotent)."""
+        """Install as a source hook on a ``PipelineCore`` (idempotent). Attaching to a different
+        core than last time starts a new run (``reset``)."""
+        if self._core is not None and core is not self._core:
+            self.reset()
         self._core = core
         self._simulated = bool(getattr(core, "simulated", False))
         if self.process not in core.source_hooks:
@@ -664,10 +744,17 @@ class FaultController:
     # -- requests (any thread) ----------------------------------------------------------------
 
     def request(self, name: str, on: bool | None = None, params: Mapping[str, Any] | None = None):
-        """Switch ``name`` on/off (``on=None`` toggles) at the next frame. Raises ``KeyError`` for
-        an unknown fault and ``ValueError`` for bad params, in the caller's thread."""
+        """Switch ``name`` on/off at the next frame. Raises ``KeyError`` for an unknown fault and
+        ``ValueError`` for bad params, in the caller's thread.
+
+        A manual switch overrides the schedule for the rest of the run: ``on=False`` turns off a
+        fault a scheduled window is holding on, and ``on=True`` keeps one on after its window.
+        ``on=None`` toggles the fault's *actual* state at that frame (active -> off, else on);
+        several toggles for the same fault within one frame count as one, so a held-down key
+        cannot leave the result to odd/even chance. New ``params`` for a fault that is already
+        active restart it with those params."""
         merged = {**self.defaults.get(name, {}), **(params or {})}
-        build_fault(name, merged, detector_conf=self.detector_conf)
+        _validate(name, merged, detector_conf=self.detector_conf)
         with self._lock:
             self._pending.append((name, on, dict(params or {})))
 
@@ -719,16 +806,41 @@ class FaultController:
         """Apply queued requests and the schedule; True if a fault started or stopped."""
         with self._lock:
             pending, self._pending = self._pending, []
+            net_failed, self._net_failed = self._net_failed, None
+        changed = False
+        if net_failed is not None and "kill_network" in self._active:
+            # The cut ran on the network worker and failed: the stream never went down, so the
+            # log must not say it did.
+            self._stop("kill_network", fi, t, reason=f"cut failed: {net_failed}", restore=False)
+            self._refused["kill_network"] = f"cut failed: {net_failed}"
+            self._record("unavailable", "kill_network", fi, t, "network", {}, False, net_failed)
+            changed = True
+        restart: set[str] = set()
+        toggled: set[str] = set()
         for name, on, params in pending:
-            new = (not self._manual.get(name, False)) if on is None else bool(on)
+            if on is None:
+                if name in toggled:
+                    continue  # one toggle per fault per frame
+                toggled.add(name)
+                new = name not in self._active and name not in self._refused
+            else:
+                new = bool(on)
             self._manual[name] = new
             if new:
-                self._manual_params[name] = params
+                active = self._active.get(name)
+                if params and active is not None:
+                    merged = {**self.defaults.get(name, {}), **params}
+                    new_params = build_fault(name, merged, detector_conf=self.detector_conf).params
+                    if new_params != active.params:
+                        restart.add(name)
+                if params or name not in self._manual_params:
+                    self._manual_params[name] = params
         assert self._t0 is not None
         desired: dict[str, tuple[dict[str, Any], str]] = {}
         for name in FAULTS:
-            if self._manual.get(name):
-                desired[name] = (self._manual_params.get(name, {}), "manual")
+            if name in self._manual:  # a manual switch, either way, overrides the schedule
+                if self._manual[name]:
+                    desired[name] = (self._manual_params.get(name, {}), "manual")
                 continue
             for sch in self.schedule:
                 x = t - self._t0 if sch.unit == "s" else fi - self._fi0
@@ -737,13 +849,19 @@ class FaultController:
                     break
         for name in [n for n in self._refused if n not in desired]:
             del self._refused[name]  # a refusal lasts only while it is still being asked for
-        changed = False
         for name in FAULTS:
+            if name in self._active and name in restart and name in desired:
+                self._stop(name, fi, t, reason="params changed")
+                changed = True
             if name in self._active and name not in desired:
                 self._stop(name, fi, t)
                 changed = True
             elif name in desired and name not in self._active and name not in self._refused:
                 changed |= self._start(name, *desired[name], fi, t)
+            elif name in desired and name in self._active:
+                window = self._window_of.get(name)
+                if window is not None and window["source"] != desired[name][1]:
+                    window["source"] = desired[name][1]  # e.g. the operator took over a window
         return changed
 
     def _start(self, name: str, params: dict[str, Any], source: str, fi: int, t: float) -> bool:
@@ -854,6 +972,9 @@ class FaultController:
                 self._net_state = "error"
                 self._net_error = f"{type(exc).__name__}: {exc}"
                 logger.exception("network fault: %s failed", action)
+                if action == "cut":
+                    with self._lock:  # the pipeline thread ends the window at its next frame
+                        self._net_failed = self._net_error
             self._publish_stats()
 
         if getattr(target, "instant", False):
@@ -919,6 +1040,9 @@ class FaultController:
                 "network": self._net_state,
                 "windows": len(self._windows),
                 "pending": len(self._pending),
+                # For the GUI's SIMULATED label (CLAUDE.md: anything simulated says so).
+                "simulated": self._simulated,
+                "network_simulated": isinstance(self._target, SimulatedTarget),
             }
         return Stats("faults", values, t=self._last_t or 0.0, frame_idx=self._last_fi)
 
@@ -1034,7 +1158,7 @@ class HotkeyListener:
         name = self._keys.get(ch.lower())
         if name is not None:
             logger.warning("fault hotkey %r: toggling %s", ch, name)
-            self.controller.request(name)
+            self.controller.request(name)  # toggles the fault's actual state at the next frame
 
     def _run(self) -> None:
         try:
@@ -1068,10 +1192,14 @@ class HotkeyListener:
         try:
             tty.setcbreak(fd)  # keeps Ctrl-C working
             while not self._stop.is_set():
-                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                ready, _, _ = select.select([fd], [], [], 0.1)
                 if ready:
-                    ch = sys.stdin.read(1)
-                    if ch:
+                    # os.read on the fd, not sys.stdin.read: Python's text buffer would swallow a
+                    # second key typed with the first, where select() can no longer see it.
+                    data = os.read(fd, 64)
+                    if not data:
+                        return  # EOF
+                    for ch in data.decode("utf-8", errors="ignore"):
                         self._handle(ch)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -1079,7 +1207,8 @@ class HotkeyListener:
 
 def mount_fault_routes(app, controller: FaultController) -> None:
     """``GET /api/faults`` (state) and ``POST /api/faults/{name}?on=true|false`` (omit ``on`` to
-    toggle). Takes effect at the next frame."""
+    toggle the fault's actual state). Takes effect at the next frame. The GUI always sends the
+    state it wants, so a click never does the opposite of what the button shows."""
     from fastapi import HTTPException
 
     @app.get("/api/faults")
@@ -1230,10 +1359,11 @@ def run_fault_demo(
         "force": force,
     }
 
-    baseline = run_offline(f"replay:{scenario}", cfg, run_id=f"{rid}-baseline", **common)
+    # Built (and so validated) before the baseline run, so a bad parameter fails at once.
     ctrl = FaultController.from_config(
         cfg, schedule=[ScheduledFault(fault, window[0], window[1], "s", dict(params or {}))]
     )
+    baseline = run_offline(f"replay:{scenario}", cfg, run_id=f"{rid}-baseline", **common)
     target = SimulatedTarget()
     ctrl.set_network_target(target)
     faulted = run_offline(f"replay:{scenario}", cfg, run_id=rid, faults=ctrl, **common)
@@ -1464,13 +1594,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cfg = load_config(overrides=["models.enabled=false", *args.override])
-    a, _, b = args.window.partition("-")
-    window = (float(a), float(b))
+    a, dash, b = args.window.partition("-")
+    try:
+        window = (float(a), float(b))
+    except ValueError:
+        ap.error(f"--window must look like START-END in seconds, e.g. 9-12; got {args.window!r}")
+    if not dash or not window[1] > window[0] >= 0.0:
+        ap.error(f"--window needs 0 <= START < END, got {args.window!r}")
     answer = None if args.answer == "none" else args.answer
+    if args.param and args.demo == "all":
+        ap.error("--param applies to one fault; use it with --demo <fault>, not --demo all")
     params = {}
     for item in args.param:
-        key, _, raw = item.partition("=")
-        params[key.strip()] = _parse_value(raw)
+        key, eq, raw = item.partition("=")
+        if not eq or not key.strip():
+            ap.error(f"--param must be key=value, got {item!r}")
+        try:
+            params[key.strip()] = _parse_value(raw)
+        except ValueError as e:
+            ap.error(str(e))
 
     if args.demo == "all":
         combined = run_fault_montage(

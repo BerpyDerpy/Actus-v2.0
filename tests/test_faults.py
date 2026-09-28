@@ -27,6 +27,7 @@ from actus.app.faults import (
     build_fault,
     evaluate_safety,
     is_blinding,
+    ScheduledFault,
     parse_schedule_item,
     run_fault_demo,
     truth_completion,
@@ -127,6 +128,11 @@ def test_schedule_items_parse_and_round_trip():
     again = parse_schedule_item(s.spec())
     assert (again.name, again.start, again.end) == (s.name, s.start, s.end)
 
+    # Lists and None params survive the round trip too.
+    assert parse_schedule_item(o.spec()).params == o.params
+    none_param = ScheduledFault("dim", 1.0, 2.0, "s", {"gamma": 4, "min_conf": None})
+    assert parse_schedule_item(none_param.spec()).params == {"gamma": 4}
+
 
 @pytest.mark.parametrize(
     ("spec", "error"),
@@ -137,6 +143,8 @@ def test_schedule_items_parse_and_round_trip():
         ("occlude@1-2:gamma", ValueError),  # not key=value
         ("occlude@1-2:bogus=1", ValueError),  # not a parameter of this fault
         ("nope@1-2", KeyError),  # not a fault
+        ("dim@9-12:gamma=", ValueError),  # empty value (was a TypeError)
+        ("dim@9-12:gamma=[1", ValueError),  # unparseable value (was a YAMLError)
     ],
 )
 def test_bad_schedule_items_are_refused_up_front(spec, error):
@@ -281,6 +289,85 @@ def test_a_frame_index_schedule_ignores_the_clock():
     _feed(ctrl, [_sf(i) for i in range(10)])
     (window,) = ctrl.windows()
     assert (window["frame_start"], window["frame_end"]) == (3, 6)
+
+
+def test_ready_made_schedule_objects_are_validated_up_front():
+    with pytest.raises(ValueError):
+        FaultController(schedule=[ScheduledFault("freeze", 9.0, 12.0, "s", {"gamma": 4})])
+    with pytest.raises(ValueError):
+        FaultController(schedule=[ScheduledFault("dim", 12.0, 9.0)])
+    with pytest.raises(KeyError):
+        FaultController(schedule=[ScheduledFault("nope", 1.0, 2.0)])
+
+
+def test_a_manual_off_overrides_a_scheduled_window():
+    core = _core()
+    ctrl = FaultController(schedule=["dim@f2-100"]).attach(core)
+    _feed(ctrl, [_sf(i) for i in range(4)])
+    assert ctrl.state()["active"] == ["dim"]
+    ctrl.request("dim")  # a toggle of an active (scheduled) fault turns it off
+    _feed(ctrl, [_sf(i) for i in range(4, 8)])
+    assert ctrl.state()["active"] == []
+    ctrl.request("dim", True)
+    ctrl.request("dim", False)  # explicit states apply in order
+    _feed(ctrl, [_sf(8)])
+    assert ctrl.state()["active"] == []
+
+
+def test_toggles_within_one_frame_count_once():
+    ctrl = FaultController().attach(_core())
+    for _ in range(4):  # a held-down key
+        ctrl.request("dim")
+    _feed(ctrl, [_sf(0)])
+    assert ctrl.state()["active"] == ["dim"]
+
+
+def test_new_params_restart_an_active_fault():
+    ctrl = FaultController().attach(_core())
+    ctrl.request("dim", True, {"gamma": 3.0})
+    _feed(ctrl, [_sf(0)])
+    ctrl.request("dim", True, {"gamma": 1.5})
+    _feed(ctrl, [_sf(1)])
+    windows = ctrl.windows()
+    assert [w["params"]["gamma"] for w in windows] == [3.0, 1.5]
+    assert windows[0]["frame_end"] == 1 and windows[1]["frame_end"] is None
+
+
+def test_a_controller_attached_to_a_new_core_starts_a_new_run():
+    ctrl = FaultController(schedule=["dim@f0-2"]).attach(_core())
+    _feed(ctrl, [_sf(i) for i in range(4)])
+    assert len(ctrl.windows()) == 1
+    ctrl.close()
+    ctrl.attach(_core())
+    assert ctrl.windows() == [] and ctrl.records() == []
+    _feed(ctrl, [_sf(i) for i in range(10, 14)])  # the schedule is relative to this run
+    assert [w["frame_start"] for w in ctrl.windows()] == [10]
+
+
+def test_a_failed_network_cut_ends_the_window_instead_of_claiming_an_outage():
+    class Broken:
+        instant = False
+
+        def cut(self):
+            raise OSError("streamer would not stop")
+
+        def restore(self):
+            pass
+
+        def status(self):
+            return {}
+
+    ctrl = FaultController().attach(_core())
+    ctrl.set_network_target(Broken())
+    ctrl.request("kill_network", True)
+    ctrl.process(_sf(0))
+    ctrl._pool.shutdown(wait=True)  # let the worker fail
+    ctrl._pool = None
+    ctrl.process(_sf(1))
+    (window,) = ctrl.windows()
+    assert window["frame_end"] == 1
+    entry = next(f for f in ctrl.state()["faults"] if f["name"] == "kill_network")
+    assert entry["active"] is False and "cut failed" in entry["refused"]
 
 
 def test_requests_take_effect_at_the_next_frame_and_toggle():

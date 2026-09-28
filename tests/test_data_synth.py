@@ -162,6 +162,7 @@ def test_cli_end_to_end(tmp_path):
 
     out_dir = root / "synthetic"
     splits_dir = root / "splits"
+    _mark_reviewed_and_split(manifest_path, labels_dir, splits_dir, {"op01": "train"})
     rc = main(
         [
             "--manifest", str(manifest_path), "--labels-dir", str(labels_dir),
@@ -175,6 +176,57 @@ def test_cli_end_to_end(tmp_path):
     assert len(synth_list) == 3
     for line in synth_list:
         assert Path(line).exists()
+
+    # A second, smaller run leaves no stale images behind and lists only its own.
+    rc = main(
+        [
+            "--manifest", str(manifest_path), "--labels-dir", str(labels_dir),
+            "--backgrounds-dir", str(bg_dir), "--out-dir", str(out_dir),
+            "--splits-dir", str(splits_dir), "--n-images", "1", "--seed", "0",
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    assert len(list((out_dir / "images").glob("*.jpg"))) == 1
+    assert len((splits_dir / "synthetic.txt").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def _mark_reviewed_and_split(manifest_path, labels_dir, splits_dir, operators, *, reviewed=True):
+    import csv
+    import json
+
+    from tools._datalib import read_manifest
+
+    labels_dir.mkdir(parents=True, exist_ok=True)
+    with open(labels_dir / "review_status.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["image_path", "take", "frame_idx", "reviewed", "n_boxes", "reviewed_at"])
+        for r in read_manifest(manifest_path):
+            flag = "1" if reviewed else "0"
+            w.writerow([r["image_path"], r["take"], r["frame_idx"], flag, 1, ""])
+    splits_dir.mkdir(parents=True, exist_ok=True)
+    (splits_dir / "report.json").write_text(json.dumps({"operators": operators}), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("operators", "reviewed"),
+    [({"op01": "test"}, True), ({"op01": "train"}, False)],
+    ids=["held-out-operator", "unreviewed"],
+)
+def test_cli_never_crops_held_out_or_unreviewed_frames(tmp_path, operators, reviewed):
+    manifest_path, labels_dir, root = _setup_pipeline_dir(tmp_path)
+    bg_dir = root / "backgrounds"
+    bg_dir.mkdir()
+    cv2.imwrite(str(bg_dir / "bg.jpg"), np.full((480, 640, 3), 40, np.uint8))
+    splits_dir = root / "splits"
+    _mark_reviewed_and_split(manifest_path, labels_dir, splits_dir, operators, reviewed=reviewed)
+    rc = main(
+        [
+            "--manifest", str(manifest_path), "--labels-dir", str(labels_dir),
+            "--backgrounds-dir", str(bg_dir), "--out-dir", str(root / "synthetic"),
+            "--splits-dir", str(splits_dir), "--n-images", "1",
+        ]
+    )  # fmt: skip
+    assert rc == 1  # the only frame is excluded, so there is nothing to crop
 
 
 def test_cli_errors_without_backgrounds(tmp_path):

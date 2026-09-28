@@ -48,6 +48,8 @@ perception:                      # T-PERC (handpose.py, rotation_tta.py)
   pose_model_path: null           # null -> models/perception/pose_landmarker_<pose_model>.task
   min_hand_conf: 0.5
   min_pose_conf: 0.5
+  mirrored_input: false          # true only if the source already flips frames (selfie view);
+                                 # false swaps MediaPipe's selfie labels -> the operator's own hand
   rotation_tta:
     enabled: true
     conf_threshold: 0.5          # re-search rotations when mean landmark conf drops below

@@ -1,0 +1,28 @@
+# Config overlay for the second protocol (T-PROTO2). Everything else comes from default.yaml.
+#
+#   uv run python tools/run_offline.py data/raw/op05_secondary_01.mp4 --config configs/sample_mixing.yaml
+#   uv run python -m actus.app.pipeline --live --config configs/sample_mixing.yaml
+#   uv run python tools/demo_protocol2.py correct        # SIMULATED scene, no camera or weights
+#
+# The objects are plain COCO classes, so the detector is the stock YOLO11n COCO checkpoint through
+# the existing `custom` backend: it reports `cup`, `bottle` and `book` under those names, which is
+# what protocols/sample_mixing.yaml maps to its objects. Fetch it once during setup (runtime
+# stays offline); T-PKG's fetcher pins and verifies it (configs/assets.yaml: yolo11n_coco):
+#   uv run python tools/fetch_models.py yolo11n_coco
+# (AGPL-3.0, like the rest of the Ultralytics stack.) If the file is missing at run time,
+# Ultralytics would try to download it; `tools/doctor.py` reports it missing instead.
+#
+# The open-vocab backend is not used here on purpose: `detector.prompts` is a fixed mapping in
+# default.yaml, which an overlay can add to but not replace, so BAS prompts would ride along.
+
+protocol:
+  path: protocols/sample_mixing.yaml
+
+detector:
+  backend: custom
+  custom_weights: models/coco/yolo11n.pt
+
+# The HOI and temporal models were trained on the box protocol's steps and features. They do not
+# apply here, so the rule evidence (world state + hand proximity) carries this protocol alone.
+models:
+  enabled: false

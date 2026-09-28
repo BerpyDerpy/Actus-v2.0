@@ -79,8 +79,9 @@ def build_ffmpeg_push_cmd(
 
 
 def build_mediamtx_cmd(*, mediamtx_bin: str, config_path: str | Path | None = None) -> list[str]:
-    """MediaMTX takes its config path (if any) as a single positional argument; with none it
-    falls back to its own bundled ``mediamtx.yml`` next to the binary."""
+    """MediaMTX takes its config path (if any) as a single positional argument. With none it
+    looks for ``mediamtx.yml`` in the *working directory* (then /etc paths), not next to the
+    binary, so ``Streamer`` passes ``bin/mediamtx.yml`` explicitly when it exists."""
     cmd = [mediamtx_bin]
     if config_path is not None:
         cmd.append(str(config_path))
@@ -123,14 +124,20 @@ class Streamer:
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
         self._fps = 30.0
+        self.errors = 0
+        self.last_error: str | None = None
 
     def start(self, *, fps: float = 30.0) -> None:
         self._fps = float(fps)
         self._stop.clear()
         if self._manage_mediamtx:
             mediamtx_bin = resolve_binary(self._cfg.mediamtx_bin)
+            # The setup scripts put MediaMTX's default config beside the binary; use it if there.
+            config = Path(mediamtx_bin).with_name("mediamtx.yml")
             self._mediamtx = ManagedProcess(
-                build_mediamtx_cmd(mediamtx_bin=mediamtx_bin),
+                build_mediamtx_cmd(
+                    mediamtx_bin=mediamtx_bin, config_path=config if config.is_file() else None
+                ),
                 name="mediamtx",
                 backoff=self._backoff,
                 popen=self._popen,
@@ -183,14 +190,18 @@ class Streamer:
                 return
             if env is None:
                 continue
-            frame: FramePacket = env.payload
-            img = frame.image
-            if img.ndim == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            h, w = img.shape[:2]
-            pusher = self._ensure_pusher(spec, w, h)
-            ok = pusher.write_stdin(np.ascontiguousarray(img).tobytes())
-            self._maybe_publish_stats(spec, pusher, ok)
+            try:
+                frame: FramePacket = env.payload
+                img = frame.image
+                if img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                h, w = img.shape[:2]
+                pusher = self._ensure_pusher(spec, w, h)
+                ok = pusher.write_stdin(np.ascontiguousarray(img).tobytes())
+                self._maybe_publish_stats(spec, pusher, ok)
+            except Exception as exc:  # never let one bad frame kill the stream thread
+                self.errors += 1
+                self.last_error = f"{spec.name}: {type(exc).__name__}: {exc}"
 
     def _maybe_publish_stats(
         self, spec: StreamSpec, pusher: ManagedProcess, write_ok: bool
@@ -221,6 +232,8 @@ class Streamer:
 
     def stats(self) -> dict:
         out: dict[str, dict] = {}
+        if self.errors:
+            out["streamer"] = {"errors": self.errors, "last_error": self.last_error}
         if self._mediamtx is not None:
             out["mediamtx"] = self._mediamtx.stats()
         for name, p in self._pushers.items():

@@ -48,6 +48,30 @@ def test_thin_to_budget_thins_dense_when_it_alone_exceeds_budget():
     assert len(_thin_to_budget(rows, 5)) == 5
 
 
+def test_thin_to_budget_spreads_sparse_frames_over_every_take():
+    rows = [{"sample": "sparse", "take": f"t{i // 190}"} for i in range(1900)]  # 10 takes
+    thinned = _thin_to_budget(rows, 1000)
+    assert len(thinned) == 1000
+    per_take = {}
+    for r in thinned:
+        per_take[r["take"]] = per_take.get(r["take"], 0) + 1
+    assert set(per_take) == {f"t{i}" for i in range(10)}  # the last takes are not starved
+    assert max(per_take.values()) - min(per_take.values()) <= 1
+
+
+def test_write_yolo_label_clips_boxes_to_the_image(tmp_path):
+    from tools._datalib import Box, read_yolo_label, write_yolo_label
+
+    path = tmp_path / "l.txt"
+    write_yolo_label(
+        path, [Box("red_box", 600, -10, 700, 50), Box("lid", 700, 0, 800, 10)], 640, 480
+    )
+    (box,) = read_yolo_label(path, 640, 480)  # the fully-outside box is dropped
+    assert (round(box.x1), round(box.y1), round(box.x2), round(box.y2)) == (600, 0, 640, 50)
+    for tok in path.read_text(encoding="utf-8").split()[1:]:
+        assert 0.0 <= float(tok) <= 1.0
+
+
 def test_thin_to_budget_noop_under_budget():
     rows = [{"sample": "sparse"} for _ in range(3)]
     assert _thin_to_budget(rows, 10) == rows

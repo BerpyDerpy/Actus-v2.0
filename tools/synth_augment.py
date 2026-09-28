@@ -15,6 +15,13 @@ per-crop foreground refinement.
 
 Writes ``data/synthetic/images/synth_{i:06d}.jpg``, ``data/synthetic/labels/synth_{i:06d}.txt``
 (YOLO format), ``data/splits/synthetic.txt`` and ``data/synthetic/report.json``.
+
+Crops come only from frames a human **accepted** in ``review_labels.py`` (``review_status.csv``)
+and only from **training** operators (``make_splits.py``'s ``report.json``): pasting a val/test
+operator's boxes into training data would leak the held-out split, and an unreviewed false
+positive would be taught many times over. ``--include-unreviewed`` / ``--all-operators`` opt out,
+and the report says so. ``synthetic.txt`` lists exactly the images this run wrote; leftovers from
+an earlier, larger run are deleted.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ from tools._datalib import (  # noqa: E402
     Box,
     read_classes,
     read_manifest,
+    read_reviewed,
     read_yolo_label,
     rel_to_repo,
     to_repo_path,
@@ -238,6 +246,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--grabcut", action="store_true")
+    ap.add_argument("--status", help="review status CSV (default: <labels-dir>/review_status.csv)")
+    ap.add_argument(
+        "--splits-report", help="make_splits.py report (default: <splits-dir>/report.json)"
+    )
+    ap.add_argument(
+        "--include-unreviewed", action="store_true", help="also crop boxes nobody has reviewed"
+    )
+    ap.add_argument(
+        "--all-operators",
+        action="store_true",
+        help="also crop val/test operators' frames (leaks the held-out split; ablations only)",
+    )
     args = ap.parse_args(argv)
 
     manifest_path = to_repo_path(args.manifest)
@@ -259,6 +279,32 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     classes_path = labels_dir / "classes.txt"
     classes = read_classes(classes_path) if classes_path.exists() else CLASSES
+
+    if not args.all_operators:
+        report_path = (
+            to_repo_path(args.splits_report) if args.splits_report else splits_dir / "report.json"
+        )
+        if not report_path.exists():
+            print(
+                f"no split report at {report_path}; run make_splits.py first "
+                "(or pass --all-operators for an ablation that leaks the held-out split)",
+                file=sys.stderr,
+            )
+            return 1
+        split_of = json.loads(report_path.read_text(encoding="utf-8")).get("operators", {})
+        rows = [r for r in rows if split_of.get(r["operator"]) == "train"]
+    if not args.include_unreviewed:
+        status_path = to_repo_path(args.status) if args.status else labels_dir / "review_status.csv"
+        reviewed = read_reviewed(status_path)
+        if reviewed is None:
+            print(
+                f"no review status at {status_path}; review boxes with review_labels.py first "
+                "(or pass --include-unreviewed)",
+                file=sys.stderr,
+            )
+            return 1
+        rows = [r for r in rows if r["image_path"] in reviewed]
+
     crops = extract_crops(rows, labels_dir, classes, grabcut=args.grabcut)
     if not crops:
         print(f"no reviewed boxes under {labels_dir}; run autolabel.py / review_labels.py first")
@@ -276,10 +322,24 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         classes=classes,
     )
+    report["crop_sources"] = {
+        "frames": len(rows),
+        "crops": len(crops),
+        "reviewed_only": not args.include_unreviewed,
+        "train_operators_only": not args.all_operators,
+    }
     (out_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
+    # Exactly the images this run wrote; leftovers from an earlier, larger run are removed so
+    # the directory, synthetic.txt and report.json all describe the same run.
+    img_paths = [out_dir / "images" / f"synth_{i:06d}.jpg" for i in range(args.n_images)]
+    written = {p.name for p in img_paths}
+    for old in (out_dir / "images").glob("synth_*.jpg"):
+        if old.name not in written:
+            old.unlink()
+            (out_dir / "labels" / f"{old.stem}.txt").unlink(missing_ok=True)
+
     splits_dir.mkdir(parents=True, exist_ok=True)
-    img_paths = sorted((out_dir / "images").glob("*.jpg"))
     (splits_dir / "synthetic.txt").write_text(
         "\n".join(rel_to_repo(p) for p in img_paths) + ("\n" if img_paths else ""), encoding="utf-8"
     )

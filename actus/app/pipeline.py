@@ -1095,7 +1095,7 @@ class VoiceSink:
         if want_asr:
             self._start_asr(voice_cfg)
         self._sub = bus.subscribe(
-            [Topic.ALERTS, Topic.ASKS, Topic.PROMPTS, Topic.EVENTS, Topic.ANSWERS],
+            [Topic.ALERTS, Topic.ASKS, Topic.PROMPTS, Topic.EVENTS, Topic.ANSWERS, Topic.COMMANDS],
             maxsize=128,
             policy="drop_newest",
             name="voice",
@@ -1107,7 +1107,8 @@ class VoiceSink:
             from actus.voice.asr import AskGate, AsrService, VoskRecognizer
 
             rec = VoskRecognizer(voice_cfg.get("asr.model"))
-            self.gate = AskGate()
+            # Muted while TTS plays, so the mic never answers Actus's own question.
+            self.gate = AskGate(mute_while=lambda: self.player.speaking)
             self.asr = AsrService(rec, self.gate, bus=self.bus)
             self.asr.start_mic()
         except Exception as exc:
@@ -1122,6 +1123,10 @@ class VoiceSink:
         self._thread.start()
 
     def handle(self, msg: Any) -> None:
+        if isinstance(msg, (Command, Answer)):
+            # The operator asked to hear something again ("repeat", "what's next", or a "no"
+            # that re-prompts): the engine's re-issued text is not a duplicate.
+            self.queue.forget_recent()
         if isinstance(msg, (Alert, Ask, Prompt)):
             self.queue.put_contract(msg)
         if isinstance(msg, Ask):

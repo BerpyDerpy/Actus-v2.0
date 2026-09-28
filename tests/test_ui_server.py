@@ -179,6 +179,19 @@ def test_websocket_answer_from_browser_is_published_as_gui():
     assert answer.via == InputVia.GUI
 
 
+def test_websocket_survives_a_malformed_message():
+    """Invalid JSON or a non-object is skipped; the next good message still gets through on the
+    same connection."""
+    client, bus = _make_client()
+    sub = bus.subscribe(Topic.ANSWERS, maxsize=8, name="probe")
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text("not json {")
+        ws.send_text("[1, 2]")
+        ws.send_json({"type": "Answer", "question_id": "q-S3", "value": "no"})
+        env = sub.get(timeout=5.0)
+    assert env is not None and env.payload.value == AnswerValue.NO
+
+
 def test_handle_incoming_ignores_malformed_messages(caplog):
     bus = Bus()
     sub = bus.subscribe([Topic.ANSWERS, Topic.COMMANDS], maxsize=8, name="probe")

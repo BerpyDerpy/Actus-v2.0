@@ -80,20 +80,58 @@ def build_downlink(
     }
 
 
+def _dumps(packet: dict[str, Any]) -> bytes:
+    return json.dumps(packet, separators=(",", ":")).encode("utf-8")
+
+
 def encode_downlink(packet: dict[str, Any], *, max_bytes: int = DEFAULT_MAX_BYTES) -> bytes:
     """Compact JSON encoding, enforced under ``max_bytes``.
 
-    Drops alert messages first (the least essential field for a bandwidth-restricted downlink)
-    if the packet doesn't fit; raises ``ValueError`` if it still doesn't."""
-    data = json.dumps(packet, separators=(",", ":")).encode("utf-8")
+    If the packet doesn't fit, it is trimmed in order of least essential first:
+
+    1. alert messages are dropped;
+    2. the oldest alerts are dropped, keeping the latest ones. The packet then says so:
+       ``alerts_total``, ``alerts_dropped`` and ``alert_counts`` (per kind, over every alert),
+       so a long run with many alerts still produces a packet instead of failing at run end.
+
+    Raises ``ValueError`` only if the packet is still over budget with no alerts at all (the
+    step table and header alone are too big)."""
+    data = _dumps(packet)
     if len(data) <= max_bytes:
         return data
+    alerts = list(packet.get("alerts") or [])
     trimmed = dict(packet)
-    trimmed["alerts"] = [{k: v for k, v in a.items() if k != "message"} for a in packet["alerts"]]
-    data = json.dumps(trimmed, separators=(",", ":")).encode("utf-8")
-    if len(data) > max_bytes:
-        raise ValueError(f"downlink packet is {len(data)} bytes, over the {max_bytes}-byte budget")
-    return data
+    trimmed["alerts"] = [{k: v for k, v in a.items() if k != "message"} for a in alerts]
+    data = _dumps(trimmed)
+    if len(data) <= max_bytes:
+        return data
+    counts: dict[str, int] = {}
+    for a in alerts:
+        kind = str(a.get("kind"))
+        counts[kind] = counts.get(kind, 0) + 1
+    rows = trimmed["alerts"]
+    # Binary search for the largest number of most recent alerts that fits.
+    lo, hi = 0, len(rows)
+    best: bytes | None = None
+    while lo <= hi:
+        keep = (lo + hi) // 2
+        candidate = dict(trimmed)
+        candidate["alerts"] = rows[len(rows) - keep :] if keep else []
+        candidate["alerts_total"] = len(rows)
+        candidate["alerts_dropped"] = len(rows) - keep
+        candidate["alert_counts"] = counts
+        enc = _dumps(candidate)
+        if len(enc) <= max_bytes:
+            best = enc
+            lo = keep + 1
+        else:
+            hi = keep - 1
+    if best is None:
+        raise ValueError(
+            f"downlink packet is over the {max_bytes}-byte budget even with no alerts "
+            f"({len(_dumps(dict(trimmed, alerts=[])))} bytes)"
+        )
+    return best
 
 
 def write_downlink(

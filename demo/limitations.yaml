@@ -1,0 +1,126 @@
+# T-DEMO: the limitations slide. Read by tools/make_demo_pack.py, which writes
+# demo/out/limitations.md.
+#
+# Two kinds of item:
+#   * always shown: the build plan's honesty list (section 9) and the design's standing limits;
+#   * conditional: an item that describes a gap (show_if_unmet: [gate]) appears only while that
+#     gate is unmet on the machine generating the slide, and drops off when the gap is closed.
+#     An item that is only true once something exists (show_if_met: [gate]) appears only then.
+#
+# `slide` is what goes on the slide: at most 30 words, plain words, no jargon. `note` is the
+# provenance: where the fact comes from and the date it was true. Facts marked "as of" are dated
+# and go stale; re-check them when the thing they describe is rebuilt.
+#
+# Order matters: the first six shown go on the slide, the rest go on a backup slide. Nothing is
+# dropped. Gap items come first because they are the claims most likely to be challenged.
+# {{tokens}} resolve from runs/eval/report.json exactly as in demo/shots.yaml.
+
+version: 1
+
+items:
+  - id: no_numbers_yet
+    show_if_unmet: [report_real]
+    slide: >-
+      No accuracy numbers are claimed yet: the held-out report card has not been generated on
+      real footage.
+    note: >-
+      runs/eval/report.json is missing, SIMULATED, or evaluated no takes. Vault/T-EVAL.md
+      sections 0 and 7.
+
+  - id: detector_not_trained
+    show_if_unmet: [detector_custom]
+    slide: >-
+      The custom-trained detector is not in use in this build. The detector used here is
+      open-vocabulary and does not reliably see the red box.
+    note: >-
+      Shown while the trained weights or model card are missing, or detector.backend is still
+      open_vocab. As of 2026-09-28: red_box detection rate 0.000 over 48 takes with the
+      open-vocabulary backend. Vault/T-HOI-TEMP.md section 0.2.
+
+  - id: rack_not_measured
+    show_if_unmet: [rack_measured]
+    slide: >-
+      The rack board is not yet measured into the configuration, so rack coordinates and zone
+      checks are approximate.
+    note: >-
+      configs/rack.yaml has measured: false. The filmed rigs also differed per operator.
+      Vault/T-HOI-TEMP.md section 0.1.
+
+  - id: thresholds_untuned
+    show_if_unmet: [engine_tuned]
+    slide: >-
+      The decision thresholds are the plan's hand-set defaults, not yet tuned on training-operator
+      takes.
+    note: >-
+      The engine: section of the configuration is empty. Vault/T-INT.md section 0. Tuning must
+      not use the held-out split.
+
+  - id: judge_not_model
+    slide: >-
+      The step logic is a protocol state machine over trained perception. The action model
+      supplies evidence and never decides alone.
+    note: Build plan section 9. The engine is the judge; models are sensors.
+
+  - id: small_data
+    slide: >-
+      The dataset is small and filmed on Earth. Numbers, where shown, are on held-out operators,
+      not held-out environments.
+    note: Build plan section 9.
+
+  - id: held_out_size
+    show_if_met: [report_real]
+    slide: >-
+      The held-out set is {{n_takes}} takes from operators {{operators}}. One take moves these
+      ratios by several points.
+    note: >-
+      From runs/eval/report.json. Vault/T-EVAL.md section 7 (small n; leave-one-operator-out
+      is not implemented).
+
+  - id: rotation_emulated
+    slide: >-
+      The rotated-camera test emulates having no fixed up. It is not microgravity footage, and it
+      is not full 3D body recovery.
+    note: >-
+      Build plan section 9. The claim covers the rack frame, rotation augmentation and
+      rotation test-time augmentation only.
+
+  - id: steps_are_our_reading
+    slide: >-
+      The steps of the sample experiment are our reading of a truncated official description.
+    note: Build plan assumption A4. Edit protocols/bas_boxes.yaml only if it changes.
+
+  - id: not_flight_hardware
+    slide: >-
+      Speed is measured on our own machines, not flight hardware. Cells marked not measured in
+      the README are not claimed.
+    note: Build plan section 9. Vault/T-PKG.md section 5.
+
+  - id: asks_simulated_operator
+    show_if_met: [report_real]
+    slide: >-
+      In evaluation a simulated operator answered the questions, so the ask metrics describe
+      the engine's handling of an answer, not real operators.
+    note: Vault/T-EVAL.md section 7 (the oracle operator). The report states the policy.
+
+  - id: faults_in_software
+    slide: >-
+      Faults are injected in software. On the replay the detector's response to them is a model,
+      not a measurement.
+    note: Vault/T-FAULT.md section 8.
+
+  - id: protocol2_simulated
+    slide: >-
+      The second procedure is shown on a simulated scene. It verifies where things are, not what
+      was poured, and its steps are our reading of Task B.
+    note: >-
+      Vault/T-PROTO2.md sections 1, 4 and 8. Drop this item only after real Task B takes are
+      scored.
+
+  - id: temporal_small_data
+    show_if_met: [temporal_model]
+    slide: >-
+      The temporal action model is trained on little data. Its held-out numbers are in its
+      model card next to the baselines.
+    note: >-
+      models/temporal/card.md. As of 2026-09-28 it lost to the duration-only baseline on every
+      fold (Vault/T-HOI-TEMP.md section 5). Fusion bounds it so it cannot invent a step.

@@ -1,0 +1,151 @@
+# Runtime assets ACTUS needs that git does not carry (T-PKG). One entry per file or directory.
+# Read by tools/fetch_models.py (download + verify), tools/bundle.py (offline bundle) and
+# tools/doctor.py (preflight). The paths match configs/default.yaml; if you move one there,
+# move it here too, or `tools/doctor.py` will say the config points at a missing file.
+#
+# Fields
+#   id        unique name; the key in configs/assets.lock.json
+#   dest      repo-relative path, or ~/... for the user's home
+#   kind      file (default) | zip_dir (a .zip unpacked into the directory `dest`) | local
+#             (made by another lane, not downloadable: listed so it is checked and bundled)
+#   url       where to fetch it
+#   sha256    pin. Leave it out and the first download is trusted; `fetch_models.py --lock`
+#             then writes the hash to configs/assets.lock.json and every later fetch is checked
+#             against it. (For a zip_dir the pin is the directory-tree hash.) No `sha256:` is set
+#             below: a pin typed in without downloading the file is worse than none.
+#   group     perception | voice | open_vocab | coco | trained   (the MediaMTX and FFmpeg
+#             binaries are platform-specific and added in code, group "media")
+#   optional  true = fetched only with --all, or when named explicitly
+#
+# The mediapipe and Vosk assets come from their publishers' own hosts; the Kokoro files from the
+# kokoro-onnx model-files release. A URL that moves is a 404, never a silent substitution.
+
+schema_version: 1
+
+assets:
+  # ---- MediaPipe (perception.hand_model_path / pose_model_path) -----------------------------
+  - id: hand_landmarker
+    group: perception
+    dest: models/perception/hand_landmarker.task
+    url: https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+    size_mb: 7.5
+    licence: Apache-2.0 (MediaPipe)
+    description: MediaPipe Hand Landmarker task bundle
+
+  - id: pose_landmarker_lite
+    group: perception
+    dest: models/perception/pose_landmarker_lite.task
+    url: https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task
+    size_mb: 5.8
+    licence: Apache-2.0 (MediaPipe)
+    description: MediaPipe Pose Landmarker (lite), the default perception.pose_model
+
+  - id: pose_landmarker_full
+    group: perception
+    optional: true
+    dest: models/perception/pose_landmarker_full.task
+    url: https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task
+    size_mb: 9.4
+    licence: Apache-2.0 (MediaPipe)
+    description: MediaPipe Pose Landmarker (full), for perception.pose_model=full
+
+  - id: pose_landmarker_heavy
+    group: perception
+    optional: true
+    dest: models/perception/pose_landmarker_heavy.task
+    url: https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task
+    size_mb: 30
+    licence: Apache-2.0 (MediaPipe)
+    description: MediaPipe Pose Landmarker (heavy), for perception.pose_model=heavy
+
+  # ---- Open-vocabulary detector: the fallback until the custom detector is trained ---------
+  # detector.open_vocab_weights is a bare file name, which ultralytics resolves against the
+  # working directory (scripts/run_demo.sh runs from the repo root), so it lives at the root.
+  - id: yolo_world_s
+    group: open_vocab
+    dest: yolov8s-worldv2.pt
+    url: https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8s-worldv2.pt
+    fallback: ultralytics
+    size_mb: 26
+    licence: AGPL-3.0 (Ultralytics)
+    description: YOLO-World small, v2 (detector.backend=open_vocab)
+
+  # YOLO-World turns its text prompts into embeddings with OpenAI's CLIP ViT-B/32 text encoder.
+  # ultralytics loads it through the `clip` package, which looks in ~/.cache/clip and otherwise
+  # downloads at run time. Fetching it here keeps that download out of the runtime path. The
+  # SHA-256 is the URL's parent folder, which is how OpenAI's own loader verifies it. That URL
+  # was written from memory and has not been fetched: if it is wrong the result is a 404 or a
+  # hash mismatch (the file is discarded), never a wrong file. `fetch_models.py --warm` is the
+  # fallback, because it lets ultralytics download the encoder itself.
+  - id: clip_vit_b32
+    group: open_vocab
+    dest: ~/.cache/clip/ViT-B-32.pt
+    url: https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt
+    sha256_from_url: true
+    size_mb: 338
+    licence: MIT (OpenAI CLIP)
+    description: CLIP ViT-B/32, used by YOLO-World's set_classes()
+
+  # ---- Second protocol (configs/sample_mixing.yaml) -----------------------------------------
+  # Cup, bottle and book are plain COCO classes, so the stock YOLO11n COCO checkpoint detects
+  # them through the `custom` backend, with no training. Requested by Vault/T-PROTO2.md.
+  - id: yolo11n_coco
+    group: coco
+    dest: models/coco/yolo11n.pt
+    url: https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt
+    fallback: ultralytics
+    size_mb: 5.4
+    licence: AGPL-3.0 (Ultralytics)
+    description: Stock YOLO11n COCO checkpoint (detector.custom_weights in the overlay)
+
+  # ---- Voice (voice.tts.*, voice.asr.model) -------------------------------------------------
+  - id: kokoro_model
+    group: voice
+    dest: models/voice/kokoro-v1.0.onnx
+    url: https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+    size_mb: 310
+    licence: Apache-2.0 (Kokoro-82M)
+    description: Kokoro-82M TTS model (voice.tts.kokoro_model)
+
+  - id: kokoro_voices
+    group: voice
+    dest: models/voice/voices-v1.0.bin
+    url: https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+    size_mb: 27
+    licence: Apache-2.0 (Kokoro-82M)
+    description: Kokoro voice pack (voice.tts.kokoro_voices)
+
+  - id: vosk_small_en
+    group: voice
+    kind: zip_dir
+    dest: models/voice/vosk-model-small-en-us-0.15
+    url: https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+    size_mb: 40
+    licence: Apache-2.0 (Vosk models)
+    description: Vosk small English recogniser (voice.asr.model)
+
+  # ---- Trained here, not downloaded ---------------------------------------------------------
+  # Listed so that `doctor` reports them and `bundle` carries them (with their model cards, since
+  # the whole models/ tree is bundled). A missing one is not an error: the pipeline falls back
+  # (open-vocab detector, rule evidence).
+  - id: detector_custom
+    group: trained
+    kind: local
+    dest: models/detector/best.onnx
+    produced_by: T-DET-TRAIN (tools/train_detector.py)
+    description: Custom YOLO11n detector (detector.custom_weights); the default only when its
+      held-out mAP50 is at least 0.85
+
+  - id: hoi_model
+    group: trained
+    kind: local
+    dest: models/hoi/hoi.npz
+    produced_by: T-HOI-TEMP (tools/train_hoi.py)
+    description: Hand-object interaction classifier (models.hoi)
+
+  - id: temporal_model
+    group: trained
+    kind: local
+    dest: models/temporal/temporal.npz
+    produced_by: T-HOI-TEMP (tools/train_temporal.py)
+    description: Temporal action model (models.temporal)

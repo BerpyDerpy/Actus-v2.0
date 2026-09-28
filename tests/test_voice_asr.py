@@ -153,6 +153,82 @@ def test_feed_flushes_the_recognizer_when_the_gate_closes_mid_utterance():
     assert rec.flush_calls == 1
 
 
+class _PartialRecognizer:
+    """Never finishes an utterance on ``accept``; ``flush`` returns ``final``."""
+
+    def __init__(self, final: str) -> None:
+        self.final = final
+        self.accepted = 0
+        self.flush_calls = 0
+
+    def accept(self, pcm: bytes) -> str | None:
+        self.accepted += 1
+        return None
+
+    def flush(self) -> str:
+        self.flush_calls += 1
+        return self.final
+
+
+def test_push_to_talk_release_still_handles_the_flushed_command():
+    bus = Bus()
+    sub = bus.subscribe(Topic.COMMANDS, name="test")
+    rec = _PartialRecognizer("next")
+    gate = AskGate()
+    gate.set_push_to_talk(True)
+    svc = AsrService(rec, gate, bus=bus)
+    svc.feed(b"\x00\x00")
+    gate.set_push_to_talk(False)
+    svc.feed(b"\x00\x00")
+    env = sub.get(timeout=0.1)
+    assert env is not None and env.payload.name is CommandName.NEXT
+
+
+def test_speech_in_progress_is_not_attributed_to_a_newer_question():
+    bus = Bus()
+    sub = bus.subscribe([Topic.ANSWERS, Topic.COMMANDS], name="test")
+    rec = _PartialRecognizer("yes")
+    gate = AskGate()
+    gate.on_ask(Ask("q1", "S3", "Did you place it?", frame_idx=0, t=0.0))
+    svc = AsrService(rec, gate, bus=bus)
+    svc.feed(b"\x00\x00")  # "yes" in progress for q1
+    gate.on_ask(Ask("q2", "S5", "Did you place the yellow box?", frame_idx=1, t=1.0))
+    svc.feed(b"\x00\x00")  # the question changed: the partial is discarded
+    assert rec.flush_calls == 1
+    assert sub.get(timeout=0.05) is None
+
+
+def test_gate_is_muted_while_actus_speaks_and_the_echo_is_discarded():
+    bus = Bus()
+    sub = bus.subscribe([Topic.ANSWERS, Topic.COMMANDS], name="test")
+    speaking = {"on": True}
+    rec = _PartialRecognizer("no")
+    gate = AskGate(mute_while=lambda: speaking["on"])
+    gate.on_ask(Ask("q1", "S3", "Did you place it?", frame_idx=0, t=0.0))
+    svc = AsrService(rec, gate, bus=bus)
+    assert not gate.listening
+    svc.feed(b"\x00\x00")
+    assert rec.accepted == 0  # the mic is not decoded while the question is being read out
+    speaking["on"] = False
+    assert gate.listening
+    svc.feed(b"\x00\x00")
+    speaking["on"] = True  # a later prompt starts playing mid-utterance
+    svc.feed(b"\x00\x00")
+    assert rec.flush_calls == 1
+    assert sub.get(timeout=0.05) is None  # the partial was echo-risk: discarded
+
+
+def test_step_event_for_the_asked_step_closes_the_gate():
+    from actus.core.contracts import StepEvent, StepStatus
+
+    gate = AskGate()
+    gate.on_ask(Ask("q1", "S3", "Did you place it?", frame_idx=0, t=0.0))
+    gate.on_step_event(StepEvent("S2", StepStatus.VERIFIED, 0.0, 1.0, 0.9, {}, frame_idx=1, t=1.0))
+    assert gate.listening
+    gate.on_step_event(StepEvent("S3", StepStatus.VERIFIED, 1.0, 2.0, 0.9, {}, frame_idx=2, t=2.0))
+    assert not gate.listening
+
+
 def test_command_recognized_without_an_open_question_is_published_as_command():
     bus = Bus()
     sub = bus.subscribe(Topic.COMMANDS, name="test")

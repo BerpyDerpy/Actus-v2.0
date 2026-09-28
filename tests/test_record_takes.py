@@ -66,6 +66,20 @@ def test_label_track_undo_and_collapse(tmp_path):
     assert back.items() == [(0, 0.0, "idle"), (10, 0.5, "S1")]
 
 
+def test_label_track_undo_restores_exactly_what_one_press_changed():
+    tr = rt.LabelTrack()
+    tr.set(3, 0.1, "S1")
+    tr.set(3, 0.1, "S2")  # a second press on the same frame
+    assert tr.undo() == 3
+    assert tr.label_at(3) == "S1"  # back to S1, not both labels gone
+    tr.set(5, 0.2, "S2")
+    tr.set(3, 0.1, "S3")  # playback: stepped back to frame 3 and relabelled it
+    assert tr.undo() == 3
+    assert tr.label_at(3) == "S1" and tr.label_at(5) == "S2"  # the f5 label is untouched
+    assert tr.undo() == 5 and tr.undo() == 3
+    assert tr.items() == [(0, 0.0, "idle")] and not tr.has_labels
+
+
 def test_record_replay_source_headless(tmp_path):
     rt.main([
         "--operator", "op00", "--scenario", "selftest", "--source", "replay:correct",

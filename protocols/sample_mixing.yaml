@@ -1,0 +1,76 @@
+# Second protocol (T-PROTO2): sample-mixing staging with everyday objects (Task B).
+#
+# Purpose: show that the sequencer is task-agnostic. Nothing outside this file (and the config
+# overlay configs/sample_mixing.yaml) changes when the procedure changes.
+#
+# The objects are plain COCO classes (cup, bottle, book), so the stock YOLO11n COCO weights detect
+# them without any training. Only one thing about them is sensed: WHERE each one is, in rack
+# coordinates. Pouring cannot be seen from a position, so the procedure is the staging around it:
+# cup on the mixing pad, bottle brought next to it, book moved to the record area.
+#
+# Our reading of Task B (build plan, assumption A4 style): the recording doc could not be opened
+# while this was written. If Task B differs, edit this file only. Keep step ids S1..S5, the
+# T-REC annotation keys (1-9) and the CSV labels use them.
+#
+# Design rules that keep the protocol sound for the engine (tests/test_proto2_protocol.py
+# checks them):
+#   * every post-state PERSISTS to the end of the run. A step whose post-state a later step
+#     reverses is "undone", and the engine flags that as `unexpected` unless the reversing step is
+#     completing at the same instant. A cup carried away from the pad would trip it. So an object
+#     is only ever moved once towards its final place, exactly as the box protocol does.
+#   * a pick-up is expressed as leaving the source zone (`bottle.in_zone_S: false`), the same way
+#     the box protocol expresses "take out" as `red.in_outer: false`, and it carries requires_hoi.
+#   * only predicate forms the world model supports (<obj>.held, <obj>.in_zone_<Z>) are used.
+#
+# Rack frame: metres, origin at the board's top-left corner, +x right, +y down (configs/rack.yaml).
+# The zones deliberately avoid the four corner markers. Tape M, R and S on the board (H-PROPS);
+# R and S are the box protocol's Zone A and Zone B tape, so nothing needs to be re-taped for them.
+
+id: sample_mixing_v1
+title: "Sample mixing: stage the cup and bottle, log the book"
+version: 1
+
+objects:
+  cup:    {label: "cup",    classes: [cup]}
+  bottle: {label: "bottle", classes: [bottle]}
+  book:   {label: "book",   classes: [book]}
+
+zones:
+  M: [[0.10, 0.30], [0.45, 0.60]]     # mixing pad
+  R: [[0.55, 0.10], [0.80, 0.35]]     # record area
+  S: [[0.55, 0.45], [0.80, 0.70]]     # stowage: the bottle and the book start here
+
+# The cup starts beside the board (in no zone); the bottle and book start in the stowage zone.
+initial:
+  cup.in_zone_M: false
+  cup.held: false
+  bottle.in_zone_S: true
+  bottle.in_zone_M: false
+  bottle.held: false
+  book.in_zone_S: true
+  book.in_zone_R: false
+  book.held: false
+
+steps:
+  - {id: S1, text: "Place the cup on the mixing pad",         post: {cup.in_zone_M: true},
+     ask: "I couldn't confirm the cup is on the mixing pad. Did you place it?"}
+  - {id: S2, text: "Take the bottle from the stowage area",   pre: {bottle.in_zone_S: true},
+     post: {bottle.in_zone_S: false}, requires_hoi: bottle}
+  - {id: S3, text: "Place the bottle next to the cup",        post: {bottle.in_zone_M: true},
+     ask: "I couldn't confirm the bottle is on the mixing pad. Did you place it?"}
+  - {id: S4, text: "Take the book from the stowage area",     pre: {book.in_zone_S: true},
+     post: {book.in_zone_S: false}, requires_hoi: book}
+  - {id: S5, text: "Place the book in the record area",       post: {book.in_zone_R: true},
+     ask: "I couldn't confirm the book is in the record area. Did you place it?"}
+
+order: strict
+
+timing:
+  dwell_s: 0.8
+  timeout_s: 60
+
+decision:
+  p_enter: 0.8
+  p_exit: 0.6
+  ask_band: [0.45, 0.8]
+  ask_after_s: 3.0

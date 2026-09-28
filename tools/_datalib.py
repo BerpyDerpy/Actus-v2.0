@@ -146,6 +146,16 @@ def read_manifest(path: str | Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
+def read_reviewed(status_path: str | Path) -> set[str] | None:
+    """``image_path``s that ``review_labels.py`` marked accepted, or None if there is no status
+    file at all (nothing has been reviewed yet)."""
+    status_path = Path(status_path)
+    if not status_path.exists():
+        return None
+    with open(status_path, encoding="utf-8", newline="") as f:
+        return {r["image_path"] for r in csv.DictReader(f) if r.get("reviewed") == "1"}
+
+
 # --------------------------------------------------------------------------------------------
 # YOLO label files (autolabel <-> review_labels <-> synth_augment)
 # --------------------------------------------------------------------------------------------
@@ -175,11 +185,18 @@ class Box:
 def write_yolo_label(
     path: str | Path, boxes: list[Box], img_w: int, img_h: int, classes: tuple[str, ...] = CLASSES
 ) -> None:
+    """Boxes are clipped to the image first (a box dragged past the window edge in the reviewer
+    would otherwise give coordinates outside [0, 1], and Ultralytics drops the whole frame);
+    a box with nothing left inside the image is dropped."""
     lines = []
     for b in boxes:
+        x1, x2 = min(max(b.x1, 0.0), float(img_w)), min(max(b.x2, 0.0), float(img_w))
+        y1, y2 = min(max(b.y1, 0.0), float(img_h)), min(max(b.y2, 0.0), float(img_h))
+        if x2 <= x1 or y2 <= y1:
+            continue
         cid = classes.index(b.cls)
-        cx, cy = (b.x1 + b.x2) / 2 / img_w, (b.y1 + b.y2) / 2 / img_h
-        w, h = (b.x2 - b.x1) / img_w, (b.y2 - b.y1) / img_h
+        cx, cy = (x1 + x2) / 2 / img_w, (y1 + y2) / 2 / img_h
+        w, h = (x2 - x1) / img_w, (y2 - y1) / img_h
         lines.append(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

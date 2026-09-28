@@ -111,6 +111,7 @@ def create_app(
     app.state.protocol = protocol
     app.state.demo_stop = None
     app.state.demo_thread = None
+    app.state.demo_lock = threading.Lock()  # a double-clicked "start" must not leave two replays
 
     @app.get("/api/protocol")
     def get_protocol() -> Any:
@@ -157,7 +158,16 @@ def create_app(
         send_task = asyncio.create_task(_relay(websocket, sub))
         try:
             while True:
-                data = await websocket.receive_json()
+                text = await websocket.receive_text()
+                # One malformed message is logged and skipped; it never ends the connection.
+                try:
+                    data = json.loads(text)
+                except ValueError:
+                    logger.warning("ws: ignoring a message that is not JSON: %.80r", text)
+                    continue
+                if not isinstance(data, dict):
+                    logger.warning("ws: ignoring a message that is not an object: %.80r", text)
+                    continue
                 _handle_incoming(bus, data)
         except WebSocketDisconnect:
             pass
@@ -260,30 +270,32 @@ def _mount_demo_routes(app: FastAPI, bus: Bus, config: Config, protocol: Protoco
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
-        _stop_demo(app)
-        stop = threading.Event()
-        src = ReplaySource(
-            scenario,
-            protocol=protocol,
-            render=True,
-            fps=config.get("replay.fps", 15.0),
-            seed=config.get("replay.seed", 0),
-            noise=config.get("replay.noise", 0.04),
-        )
-        thread = threading.Thread(
-            target=src.run,
-            kwargs={"bus": bus, "realtime": True, "stop": stop},
-            daemon=True,
-            name=f"demo-replay-{scenario}",
-        )
-        app.state.demo_stop = stop
-        app.state.demo_thread = thread
-        thread.start()
+        with app.state.demo_lock:
+            _stop_demo(app)
+            stop = threading.Event()
+            src = ReplaySource(
+                scenario,
+                protocol=protocol,
+                render=True,
+                fps=config.get("replay.fps", 15.0),
+                seed=config.get("replay.seed", 0),
+                noise=config.get("replay.noise", 0.04),
+            )
+            thread = threading.Thread(
+                target=src.run,
+                kwargs={"bus": bus, "realtime": True, "stop": stop},
+                daemon=True,
+                name=f"demo-replay-{scenario}",
+            )
+            app.state.demo_stop = stop
+            app.state.demo_thread = thread
+            thread.start()
         return {"started": scenario, "simulated": True}
 
     @app.post("/api/demo/stop")
     def stop_demo() -> Any:
-        _stop_demo(app)
+        with app.state.demo_lock:
+            _stop_demo(app)
         return {"stopped": True}
 
 
@@ -354,18 +366,23 @@ async def _mjpeg_frames(bus: Bus):
     import cv2
     from starlette.concurrency import run_in_threadpool
 
-    sub = bus.subscribe(FRAME_TOPICS, maxsize=2, policy="drop_oldest", name="ui-mjpeg")
-    seen_annotated = False
+    # Separate queues: raw frames are only the fallback, and in one shared queue they would push
+    # the annotated frames out. Once a pipeline publishes annotated frames, the raw subscription
+    # is dropped, so the feed never flickers between the two.
+    ann = bus.subscribe(Topic.ANNOTATED, maxsize=2, policy="drop_oldest", name="ui-mjpeg")
+    raw: Any = bus.subscribe(Topic.FRAMES, maxsize=2, policy="drop_oldest", name="ui-mjpeg-raw")
     try:
         while True:
-            env = await run_in_threadpool(sub.get, 1.0)
+            if raw is None:
+                env = await run_in_threadpool(ann.get, 1.0)
+            else:
+                env = await run_in_threadpool(ann.get, 0.05)
+                if env is not None:
+                    raw.unsubscribe()
+                    raw = None
+                else:
+                    env = await run_in_threadpool(raw.get, 0.05)
             if env is None:
-                continue
-            # Raw frames are only the fallback: once a pipeline publishes annotated frames,
-            # interleaving the two would make the feed flicker between them.
-            if env.topic is Topic.ANNOTATED:
-                seen_annotated = True
-            elif seen_annotated:
                 continue
             packet = env.payload
             ok, buf = cv2.imencode(".jpg", packet.image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
@@ -382,7 +399,9 @@ async def _mjpeg_frames(bus: Bus):
     except BusClosed:
         return
     finally:
-        sub.unsubscribe()
+        ann.unsubscribe()
+        if raw is not None:
+            raw.unsubscribe()
 
 
 def main(argv: list[str] | None = None) -> int:

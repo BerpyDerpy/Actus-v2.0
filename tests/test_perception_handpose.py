@@ -63,6 +63,27 @@ def test_build_hand_set_lowercases_side_and_carries_rotation():
     assert all(h.landmarks_rack is None for h in hs.hands)
 
 
+def test_build_hand_set_swaps_selfie_labels_for_an_unmirrored_camera():
+    hands = (_hand("Left", 0.9), _hand("Right", 0.8))
+    hs = build_hand_set(0, 0.0, hands, mirrored_input=False)
+    assert [h.side for h in hs.hands] == ["right", "left"]
+
+
+def test_raw_estimate_confidence_ignores_a_disabled_pose_landmarker():
+    hands = RawHands((_hand("Left", 0.9), _hand("Right", 0.9)))
+    est = RawEstimate(hands, RawPose(None, None, None, 0.0), pose_enabled=False)
+    assert est.confidence == pytest.approx(0.9)
+
+
+def test_clone_copies_settings_but_not_state():
+    est = HandPoseEstimator(enable_pose=False, num_hands=1, mirrored_input=True)
+    est._last_ts_ms = 1234
+    c = est.clone()
+    assert c is not est
+    assert (c.enable_pose, c.num_hands, c.mirrored_input) == (False, 1, True)
+    assert c._last_ts_ms == -1
+
+
 def test_build_hand_set_rejects_unexpected_handedness():
     with pytest.raises(ValueError):
         build_hand_set(0, 0.0, (_hand("Sideways", 0.9),))
@@ -97,6 +118,7 @@ def test_handpose_estimator_from_config_reads_perception_section():
     assert est.enable_pose is True
     assert est.num_hands == 2
     assert est.pose_variant == "lite"
+    assert est.mirrored_input is False
 
 
 # --------------------------------------------------------------------------------------------

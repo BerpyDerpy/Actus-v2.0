@@ -9,7 +9,14 @@ sequentially, never seeked, so ``frame_idx`` matches T-REC's own decode-order co
 Writes ``<out-dir>/<take>/frame_{frame_idx:06d}.jpg`` and ``<out-dir>/manifest.csv`` (one row per
 extracted frame: image_path, take, operator, scenario, n, frame_idx, t, label, sample). The
 manifest is the source of truth for downstream tools; ``--max-frames`` thins it globally (across
-all takes) if the plan below produces more than that, dense frames first.
+all takes) if the plan below produces more than that, dense frames first, and the rest evenly
+across every take.
+
+``t`` is the container's own timestamp for the frame (``CAP_PROP_POS_MSEC``), read while
+decoding; ``frame_idx / container_fps`` only if the container has no timestamps; ``--fps`` is a
+last resort, and a warning says so. ``--takes`` re-extracts only those takes and *merges* them
+into an existing manifest; the other takes' rows are kept. A planned frame that turns out not to
+exist (the container over-reported its frame count) is dropped from the manifest.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 from tools._datalib import (  # noqa: E402
     Take,
     discover_takes,
+    read_manifest,
     rel_to_repo,
     to_repo_path,
     write_manifest,
@@ -63,15 +71,25 @@ def _thin_to_budget(rows: list[dict], max_frames: int | None) -> list[dict]:
         keep = {round(i * stride) for i in range(max_frames)}
         return [r for i, r in enumerate(dense) if i in keep]
     budget = max_frames - len(dense)
-    stride = max(1, len(sparse) // budget)
-    return dense + sparse[::stride][:budget]
+    # Evenly spaced over the whole sparse list (every take), not a floored stride plus a
+    # truncation that would starve the takes listed last.
+    n = len(sparse)
+    keep = {min(n - 1, int(i * n / budget)) for i in range(budget)}
+    return dense + [r for i, r in enumerate(sparse) if i in keep]
 
 
 def _video_fps_and_count(video_path: Path, fallback_fps: float) -> tuple[float, int]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"could not open {video_path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or fallback_fps
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        print(
+            f"warning: {video_path.name} reports no fps; using --fps {fallback_fps:g} for the "
+            "dense window (t comes from the container timestamps where it has them)",
+            file=sys.stderr,
+        )
+        fps = fallback_fps
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if n <= 0:  # some containers under-report; discover by decoding once
         n = 0
@@ -108,7 +126,7 @@ def candidate_rows(
             "scenario": take.scenario,
             "n": take.n,
             "frame_idx": fi,
-            "t": round(fi / fps, 4),
+            "t": round(fi / fps, 4),  # replaced by the container timestamp when decoded
             "label": track.label_at(fi),
             "sample": sample,
         }
@@ -135,6 +153,9 @@ def write_selected_frames(
                 params = [cv2.IMWRITE_JPEG_QUALITY, quality] if fmt == "jpg" else []
                 cv2.imwrite(str(img_path), frame, params)
             by_idx[fi]["image_path"] = rel_to_repo(img_path)
+            msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if (msec and msec > 0) or fi == 0:  # 0 ms is real only for the first frame
+                by_idx[fi]["t"] = round((msec or 0.0) / 1000.0, 4)
         fi += 1
         ok, frame = cap.read()
     cap.release()
@@ -190,15 +211,28 @@ def main(argv: list[str] | None = None) -> int:
             write_selected_frames(
                 take, rows, out_dir, fmt=args.format, quality=args.quality, overwrite=args.overwrite
             )
+        missing = [r for r in rows if "image_path" not in r]
+        if missing:
+            print(
+                f"warning: {stem}: {len(missing)} planned frames past the real end of the video "
+                "(the container over-reported its frame count); left out of the manifest",
+                file=sys.stderr,
+            )
         n_dense = sum(1 for r in rows if r["sample"] == "dense")
         print(f"{stem}: {len(rows)} frames ({n_dense} dense, {len(rows) - n_dense} sparse)")
+    all_rows = [r for r in all_rows if "image_path" in r]
 
     manifest_path = out_dir / "manifest.csv"
+    if args.takes and manifest_path.exists():
+        # Only these takes were re-extracted: keep every other take's rows.
+        redone = set(per_take)
+        kept = [r for r in read_manifest(manifest_path) if r["take"] not in redone]
+        all_rows = kept + all_rows
     write_manifest(manifest_path, all_rows)
     n_dense = sum(1 for r in all_rows if r["sample"] == "dense")
     print(
         f"wrote {len(all_rows)} frames ({n_dense} dense, {len(all_rows) - n_dense} sparse) "
-        f"from {len(takes)} takes to {rel_to_repo(manifest_path)}"
+        f"from {len({r['take'] for r in all_rows})} takes to {rel_to_repo(manifest_path)}"
     )
     return 0
 

@@ -229,16 +229,36 @@ export interface FaultInfo {
   key: string;
   summary: string;
   expected: string;
+  defaults: Record<string, unknown>;
   active: boolean;
   refused: string | null;
 }
 
+export interface FaultWindow {
+  fault: string;
+  label: string;
+  params: Record<string, unknown>;
+  source: string;
+  blinding: boolean;
+  frame_start: number;
+  t_start: number;
+  frame_end: number | null;
+  t_end: number | null;
+}
+
+/** Mirrors FaultController.state() in actus/app/faults.py. */
 export interface FaultsState {
   available: boolean;
   simulated: boolean;
   faults: FaultInfo[];
   active: string[];
   detected: string[];
-  network: { state: string; error: string | null };
+  network: {
+    state: string;
+    error: string | null;
+    // StreamTarget.status(): kind "rtsp" (the live streamer) or "simulated" (offline demos).
+    target: ({ kind: string; down: boolean } & Record<string, unknown>) | null;
+  };
   guard: { enabled: boolean; stale_after: number | null };
+  windows: FaultWindow[];
 }

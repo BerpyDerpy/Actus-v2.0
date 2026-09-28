@@ -87,8 +87,12 @@ function reducer(state: BusState, action: Action): BusState {
   switch (action.kind) {
     case "connected":
       return { ...state, connected: true };
-    case "disconnected":
-      return { ...state, connected: false };
+    case "disconnected": {
+      // A fault reported by a run that has gone away must not stay lit.
+      const stats = { ...state.stats };
+      delete stats["faults"];
+      return { ...state, connected: false, stats };
+    }
     case "sent_answer":
       // Dismiss the ask card immediately; the log entry comes from the server's own echo of
       // this Answer on the `answers` topic (below), so it isn't duplicated here.

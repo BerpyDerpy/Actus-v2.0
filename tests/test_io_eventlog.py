@@ -132,3 +132,58 @@ def test_verify_log_detects_a_deleted_line(tmp_path):
 
     result = verify_log(log.path)
     assert not result.ok
+
+
+def test_verify_log_require_end_detects_deleted_trailing_records(tmp_path):
+    log = EventLog(tmp_path, catch_signals=False)
+    for payload in _sample_payloads():
+        log.append(payload)
+    log.close()
+    tip = log.final_hash
+
+    assert verify_log(log.path, require_end=True, expect_hash=tip).ok
+
+    lines = log.path.read_text(encoding="utf-8").splitlines()
+    log.path.write_text("\n".join(lines[:-3]) + "\n", encoding="utf-8")  # drop the tail
+    assert verify_log(log.path).ok  # the prefix still chains...
+    assert not verify_log(log.path, require_end=True).ok  # ...but it has no run_end
+    assert not verify_log(log.path, expect_hash=tip).ok  # ...and does not end at the tip
+
+
+def test_resume_moves_a_half_written_last_line_aside(tmp_path):
+    log1 = EventLog(tmp_path, catch_signals=False)
+    log1.append(_sample_payloads()[0])
+    log1.append(_sample_payloads()[1])
+    # Simulate a crash mid-append: a truncated record with no newline, and no run_end.
+    with open(log1.path, "a", encoding="utf-8") as f:
+        f.write('{"schema_version":1,"seq":2,"ts":"2026-')
+
+    log2 = EventLog(tmp_path, catch_signals=False)
+    log2.append(_sample_payloads()[2])
+    log2.close()
+
+    assert verify_log(log2.path, require_end=True).ok
+    partial = log2.path.with_name(log2.path.name + ".partial")
+    assert partial.read_text(encoding="utf-8").startswith('{"schema_version":1,"seq":2')
+
+
+def test_resume_refuses_a_log_damaged_before_its_end(tmp_path):
+    log1 = EventLog(tmp_path, catch_signals=False)
+    for payload in _sample_payloads()[:3]:
+        log1.append(payload)
+    log1.close()
+    lines = log1.path.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1][:20]  # corrupt a middle record
+    log1.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        EventLog(tmp_path, catch_signals=False)
+
+
+def test_append_after_close_raises_and_final_hash_is_the_tip(tmp_path):
+    log = EventLog(tmp_path, catch_signals=False)
+    log.append(_sample_payloads()[0])
+    summary = log.close()
+    assert log.final_hash == summary["hash"]
+    with pytest.raises(RuntimeError):
+        log.append(_sample_payloads()[1])
+    assert verify_log(log.path, require_end=True, expect_hash=log.final_hash).ok

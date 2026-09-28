@@ -16,6 +16,12 @@ __pycache__/
 !/runs/eval/
 /bin/
 
+# Packaging (T-PKG): offline bundles, their wheels, the offline-install marker, and YOLO-World's
+# weights (detector.open_vocab_weights is a bare file name, so ultralytics keeps it at the root)
+/wheels/
+/.actus-offline
+/yolo*.pt
+
 # UI build
 ui/node_modules/
 ui/dist/

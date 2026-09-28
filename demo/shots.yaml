@@ -1,0 +1,355 @@
+# T-DEMO: the walkthrough's shots. Read by tools/make_demo_pack.py, which renders
+# demo/out/walkthrough.md (the script) and demo/out/shot-list.md (what to film and how).
+#
+# One entry per shot, in running order. Fields:
+#   id, title, seconds     the shot, and the time it gets. The total must stay in 3:00-4:00.
+#   who, screen            who does what, and what the viewer sees.
+#   narration              spoken text when the shot is filmed for real (live rig, real models).
+#   narration_sim          spoken text when it is filmed from the SIMULATED replay. It must say
+#                          "simulated" out loud: a viewer who only hears the audio still knows.
+#   cmd_real, cmd_sim      the commands for each way of filming it.
+#   expect                 exactly what should be seen and heard. This is what the take is judged on.
+#   retake_if              when the take must be thrown away and shot again.
+#   notes                  anything else the person filming needs.
+#   needs_any              gates that must hold however the shot is filmed.
+#   needs_real             extra gates that must hold to film it for real (see GATES in the tool).
+#   wants                  gates whose absence degrades the shot but does not block it.
+#   replay_ok              true: it may be filmed from the replay while needs_real is unmet.
+#   always_simulated       true: the only way to film it is a simulated scene (protocol 2).
+#
+# A narration may use {{tokens}} taken from runs/eval/report.json (see Tokens in the tool). They
+# resolve to a visible "[NOT MEASURED ...]" placeholder unless the report is real and non-empty.
+# Never type a metric into a narration by hand.
+#
+# Time budget: at most 2.5 spoken words per second, checked by the tool and by its tests.
+
+version: 1
+
+shots:
+  - id: D1
+    title: Architecture in one picture
+    seconds: 15
+    who: Presenter, voice-over only.
+    screen: >-
+      Slide: the architecture diagram (build plan section 4). Point at the two halves: the
+      models on the left, the protocol engine on the right.
+    narration: >-
+      ACTUS turns a camera into a procedure checker. The models are sensors: they report
+      evidence with confidence. The protocol engine is the judge. Only it decides a step
+      happened.
+    expect: The two labels "sensors" and "judge" are on screen while they are said.
+
+  - id: D2
+    title: The live correct run
+    seconds: 25
+    who: One operator performs the six steps of the box experiment in order.
+    screen: >-
+      The Live tab: annotated video with boxes, hand skeletons and zones; the checklist ticking
+      S1 to S6; the large next-step card; the rack mini-map.
+    narration: >-
+      Here is ISRO's sample experiment, run live. ACTUS speaks each next step, ticks the
+      checklist as the evidence arrives, and draws hands and boxes on the video. The mini-map
+      shows everything relative to the rack, not the floor.
+    narration_sim: >-
+      This is a simulated run of ISRO's box experiment, not real footage. Every frame carries a
+      SIMULATED watermark. It shows the loop: a spoken next-step prompt, a checklist that ticks
+      on evidence, and the rack mini-map.
+    cmd_real: scripts/run_demo.sh --live
+    cmd_sim: scripts/run_demo.sh --replay correct
+    expect: >-
+      Each prompt is spoken ("Open the outer box", ... "Close the outer box"), each step turns
+      verified, and the run ends on "Procedure complete." with no alert and no Ask.
+    retake_if: >-
+      Any alert or Ask fires on a correct run, a step is ticked before it was done, or the
+      voice falls behind the checklist.
+    notes: >-
+      Shoot this take first, and keep it even if it is not the best one: it is the fallback
+      screen recording (H-REC) as soon as anything works end to end.
+    needs_any: [ui_built]
+    needs_real: [rack_measured, detector_custom]
+    wants: [tts_model]
+    replay_ok: true
+
+  - id: D3
+    title: Out of order
+    seconds: 20
+    who: The operator opens the box, then takes out the yellow box before the red one.
+    screen: The alert banner, the checklist row for S2 still pending, the next-step card.
+    narration: >-
+      Now the operator takes the yellow box before the red one. The voice alert fires within a
+      second: out of sequence, expected: take out the red box. The prompt keeps pointing at the
+      step that is still owed.
+    narration_sim: >-
+      Simulated scene. The yellow box is taken before the red one. The alert fires within a
+      second: out of sequence, expected: take out the red box. The prompt keeps pointing at the
+      step still owed.
+    cmd_real: scripts/run_demo.sh --live
+    cmd_sim: scripts/run_demo.sh --replay S4_before_S2
+    expect: >-
+      Spoken and shown: "Out of sequence: yellow box removed before red box. Expected: take out
+      the red box." S4 is marked out_of_order and the prompt stays on S2.
+    retake_if: The alert is late by more than a couple of seconds, or it is not spoken.
+    notes: >-
+      This scene ends with S2 and S3 done late and verified. Do not cut away before the next
+      prompt, or the "still owed" claim is not shown.
+    needs_any: [ui_built]
+    needs_real: [rack_measured, detector_custom]
+    wants: [tts_model]
+    replay_ok: true
+
+  - id: D4
+    title: A skipped step, logged retroactively
+    seconds: 15
+    who: >-
+      The operator opens the box, moves only the yellow box to Zone B, and closes the box. The
+      red box is never touched.
+    screen: >-
+      The alert banner, then the checklist: S2 and S3 turn skipped, and the event log tail shows
+      the retroactive rows.
+    narration: >-
+      The red box is never taken out. Until the procedure can go no further, this looks like out
+      of order. Then the engine logs the skip retroactively and names the missed steps.
+    narration_sim: >-
+      Simulated scene. The red box is never taken out. It first looks like out of order; when
+      the box closes, the engine logs the skip retroactively and names the missed steps.
+    cmd_real: scripts/run_demo.sh --live
+    cmd_sim: scripts/run_demo.sh --replay skip_S2
+    expect: >-
+      First the out-of-sequence alert (the same one as D3), then, when the box closes, "Skipped:
+      take out the red box; place the red box in Zone A." S2 and S3 read skipped.
+    retake_if: The skip is announced before the box is closed, or S2 is marked verified.
+    notes: >-
+      Skipping the red box also skips placing it, so two steps are named. That is the design
+      (Vault/T-ENGINE.md section 3): a skip and an out-of-order step look the same until the
+      procedure can go no further, so the skip is confirmed at the end and the narration says so.
+    needs_any: [ui_built]
+    needs_real: [rack_measured, detector_custom]
+    wants: [tts_model]
+    replay_ok: true
+
+  - id: D5
+    title: The ask path
+    seconds: 30
+    who: >-
+      The operator places the red box in Zone A. A helper immediately holds a board over the
+      zone so the camera cannot see the placement. The operator answers the question out loud.
+    screen: The Ask card with Yes and No buttons, then S3 turning operator_confirmed.
+    narration: >-
+      A helper blocks the camera's view of the placement. ACTUS does not guess. It asks: I
+      couldn't confirm the red box is in Zone A. Did you place it? The operator says yes, out
+      loud, and the step is logged as operator confirmed, never as verified.
+    narration_sim: >-
+      Simulated scene: the view is blocked after the red box arrives. ACTUS asks: I couldn't
+      confirm the red box is in Zone A. Did you place it? The answer is yes, and the step is
+      logged operator confirmed, never verified.
+    cmd_real: scripts/run_demo.sh --live
+    cmd_sim: scripts/run_demo.sh --replay occluded --evidence replay
+    expect: >-
+      The Ask is spoken and shown after the view has been blocked for about 1.5 s. Saying "yes"
+      (or clicking Yes) closes the card, and S3 reads operator_confirmed. The confidence shown
+      is the machine's own, not 1.0.
+    retake_if: >-
+      S3 turns verified instead (the view returned before the answer: block it for longer), or
+      the Ask is not spoken.
+    notes: >-
+      Voice input works only while an Ask is open (Vault/T-INT.md section 4). Without the Vosk
+      model, answer with the GUI Yes button and drop "out loud" from the narration. On the
+      replay, --evidence replay is what lets the occlusion show (the replay publishes no
+      hands); both are labelled SIMULATED. Add --answer yes for an unattended take.
+    needs_any: [ui_built]
+    needs_real: [rack_measured, detector_custom]
+    wants: [tts_model, asr_model]
+    replay_ok: true
+
+  - id: D6
+    title: The camera rolled 180 degrees
+    seconds: 20
+    who: >-
+      Mid-run, a helper rolls the camera mount a half turn while the operator carries on. The
+      ArUco markers stay in view throughout.
+    screen: >-
+      The annotated video turns upside down. The rack mini-map and the zones do not move, and
+      the checklist keeps ticking.
+    narration: >-
+      Now we roll the camera a half turn mid-run. The ArUco markers define the rack frame, so
+      the mini-map and the zones do not move. This emulates having no fixed up; it is not
+      microgravity footage.
+    cmd_real: scripts/run_demo.sh --live
+    expect: >-
+      Object and hand positions on the mini-map are unchanged by the roll; the checklist does not
+      drop or repeat a step across it.
+    retake_if: >-
+      The mini-map jumps, a zone drifts, or a step is lost across the roll. Keep that take as
+      evidence for the limitations slide rather than deleting it.
+    notes: >-
+      Physically rolling the camera is the real test. A static emulation of it is
+      --override capture.rotation=180 with --live or --file: it rotates every frame before
+      perception, so the narration then has to say "rotated in post". The replay cannot show
+      this shot (it has no camera), so it has no simulated form.
+    needs_any: [ui_built]
+    needs_real: [rack_measured, detector_custom]
+
+  - id: D7
+    title: Fault injection
+    seconds: 20
+    who: >-
+      The presenter presses the fault keys (o d f x n) or the header buttons, one after the
+      other, while the correct run plays.
+    screen: >-
+      The red FAULT INJECTED pill in the header and the tag on the video for each fault; then the
+      Ask, or the checklist holding still.
+    narration: >-
+      Now we break it on purpose. Occlude the camera, dim the light, freeze a frame, drop the
+      detector, cut the network. Each shows FAULT INJECTED. Expected behaviour: ask or abstain,
+      never a false verified; with the stream down, recording continues.
+    narration_sim: >-
+      Simulated replay, faults injected in software. Occlusion, dim light, a frozen frame, a
+      dead detector, a cut network. Each is labelled FAULT INJECTED. The check: no step is
+      verified that did not happen; with the stream cut, recording continues.
+    cmd_real: scripts/run_demo.sh --live --faults
+    cmd_sim: scripts/run_demo.sh --replay correct --faults
+    expect: >-
+      For each fault, the safe behaviour is logged (python -m actus.app.faults --list says
+      which). No step is verified inside a blinding fault. The network fault leaves the recorder,
+      the log and the GUI feed running.
+    retake_if: >-
+      A step is verified while the camera is blacked out, or FAULT INJECTED is not visible.
+    notes: >-
+      Also run python -m actus.app.faults --demo all and show its faults_report.md: it judges
+      each fault against the replay's ground truth. Without the media binaries there is no
+      streamer to cut, the network fault is refused, and the last clause of the narration must
+      be dropped.
+    needs_any: [ui_built]
+    needs_real: [rack_measured, detector_custom]
+    wants: [media_binaries]
+    replay_ok: true
+
+  - id: D8a
+    title: The tamper-evident log and the downlink packet
+    seconds: 15
+    who: The presenter, at a terminal, on the run just filmed.
+    screen: >-
+      A terminal: the verify command printing OK, one byte flipped in a copy, the verify command
+      printing TAMPERED, then the downlink packet's size.
+    narration: >-
+      The log is hash chained. Edit one byte of a copy and verification flags the tamper. The
+      downlink packet summarises the run in under four kilobytes, for a bandwidth-limited link.
+    narration_sim: >-
+      These artefacts come from a simulated run. The log is hash chained: edit one byte of a
+      copy and verification flags it. The downlink packet summarises the run in under four
+      kilobytes.
+    cmd_real: |-
+      RUN=runs/<run_id>
+      uv run python -m actus.io.eventlog verify $RUN/events.jsonl
+      cp $RUN/events.jsonl /tmp/tampered.jsonl
+      printf 'X' | dd of=/tmp/tampered.jsonl bs=1 seek=100 conv=notrunc
+      uv run python -m actus.io.eventlog verify /tmp/tampered.jsonl
+      wc -c $RUN/downlink.json
+    cmd_sim: |-
+      RUN=runs/sim-<run_id>
+      uv run python -m actus.io.eventlog verify $RUN/events.jsonl
+      cp $RUN/events.jsonl /tmp/tampered.jsonl
+      printf 'X' | dd of=/tmp/tampered.jsonl bs=1 seek=100 conv=notrunc
+      uv run python -m actus.io.eventlog verify /tmp/tampered.jsonl
+      wc -c $RUN/downlink.json
+    expect: >-
+      "OK ... chain intact" for the original, "TAMPERED ..." (exit status 1) for the copy, and a
+      downlink size under 4096 bytes.
+    retake_if: >-
+      The byte flip lands on a newline and the verifier reports something other than a tamper
+      (move the offset), or the tampered file is the original.
+    notes: >-
+      Edit a copy, never the run's own log.
+    needs_real: [rack_measured, detector_custom]
+    replay_ok: true
+
+  - id: D8b
+    title: RTSP to a second laptop, and the recordings
+    seconds: 15
+    who: >-
+      The presenter, with VLC open on a second laptop on the same network, then a file browser
+      on runs/<run_id>/video.
+    screen: >-
+      Laptop two playing the annotated stream in VLC; then the raw and annotated MP4 segments
+      playing.
+    narration: >-
+      Video goes out over RTSP to a configured IP. Here VLC on a second laptop is playing it.
+      The raw and annotated streams are also recorded to segmented MP4 files.
+    narration_sim: >-
+      Simulated source. The video goes out over RTSP to a configured IP, and VLC on a second
+      laptop is playing it. Raw and annotated streams are also recorded to segmented MP4 files.
+    cmd_real: >-
+      scripts/run_demo.sh --live --override stream.target_ip=<this machine's LAN address>
+    cmd_sim: >-
+      scripts/run_demo.sh --replay correct --override stream.target_ip=<this machine's LAN address>
+    expect: >-
+      VLC on the second laptop plays rtsp://<address>:8554/actus/annotated (and /actus/raw); the
+      files raw_NNN.mp4 and annotated_NNN.mp4 exist under runs/<run_id>/video/ and play.
+    retake_if: The second laptop shows a stale or frozen picture, or the MP4s do not play.
+    notes: >-
+      MediaMTX runs on this machine and FFmpeg pushes to stream.target_ip, so for a second
+      machine to see the stream it must be this machine's LAN address, not 127.0.0.1. That is our
+      reading of the streamer's docstring; a real push has not been run yet (Vault/T-INT.md
+      section 7), so rehearse this shot first.
+    needs_any: [media_binaries]
+    needs_real: [rack_measured, detector_custom]
+    replay_ok: true
+
+  - id: D9
+    title: A second protocol, from YAML alone
+    seconds: 15
+    who: The presenter, showing protocols/sample_mixing.yaml and then the run.
+    screen: >-
+      Split screen: the YAML on the left; on the right the annotated video of the cup, bottle
+      and book being staged, with the checklist.
+    narration_sim: >-
+      A second procedure, loaded from a YAML file alone: cup, bottle, book. No code changed. It
+      runs on a simulated scene, and it verifies where things are, not what was poured.
+    cmd_sim: uv run python tools/demo_protocol2.py correct
+    expect: >-
+      S1 to S5 verified, no alert, no Ask, and the SIMULATED watermark on every frame. The title
+      says the pour itself is not observed.
+    retake_if: The watermark is cropped out of the shot.
+    notes: >-
+      This shot is always simulated: the tool draws its own scene (Vault/T-PROTO2.md section 4).
+      It shows sequencing, alerts, asks and logs on a procedure nobody wrote code for. It is not
+      evidence about detection or pose quality. Filming it for real needs Task B footage.
+    always_simulated: true
+
+  - id: D10
+    title: The Validation tab
+    seconds: 20
+    who: The presenter, on the Validation tab.
+    screen: >-
+      The report card: the criteria table with PASS, FAIL or n/a against each pre-registered
+      target, and the take-level table.
+    narration: >-
+      This is the Validation tab, on operators held out of training. Step precision
+      {{m:step_completion_precision}}, recall {{m:step_completion_recall}}.
+      {{criteria_met}} pre-registered targets met; the targets were fixed before the first run.
+      The sample is small, and the report says so.
+    expect: >-
+      The tab shows a report whose first card reads "REAL held-out takes", not SIMULATED, and
+      whose criteria version matches runs/eval/criteria.yaml.
+    retake_if: >-
+      The tab shows a SIMULATED or empty report. Do not film this shot with replay numbers: they
+      exercise the harness, not perception.
+    notes: >-
+      Quote the numbers from the report exactly as they stand, including FAIL rows. A failed
+      target is said out loud and goes on the limitations slide; do not reword the target.
+    needs_any: [ui_built]
+    needs_real: [report_real]
+
+  - id: D11
+    title: The limitations
+    seconds: 20
+    who: Presenter, voice-over only.
+    screen: The limitations slide, generated to demo/out/limitations.md.
+    narration: >-
+      Here is what we don't claim. The dataset is small and filmed on Earth. The step logic is a
+      protocol engine over trained perception. Nothing here is flight hardware or microgravity
+      footage. The limits are on the slide, as written.
+    expect: The slide text is read from demo/out/limitations.md, not from memory.
+    notes: >-
+      Regenerate demo/out/ right before recording: which limitations appear depends on what is
+      fixed at that moment.

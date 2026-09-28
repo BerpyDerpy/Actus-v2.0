@@ -84,6 +84,25 @@ def test_full_queue_evicts_lower_priority_item_for_a_higher_priority_arrival():
     assert kinds == {"alert", "prompt"}
 
 
+def test_full_queue_evicts_the_oldest_of_equal_priority_items():
+    q = VoiceQueue(maxsize=2)
+    q.put("prompt", "old instruction")
+    q.put("prompt", "current instruction")
+    q.put("alert", "urgent")
+    texts = [q.get(timeout=0.1).text, q.get(timeout=0.1).text]
+    assert texts == ["urgent", "current instruction"]
+
+
+def test_forget_recent_lets_a_repeat_through_the_dedup_window():
+    q = VoiceQueue(dedup_s=5.0)
+    t0 = time.monotonic()
+    assert q.put("ask", "Did you place it?", now=t0) is True
+    q.forget_recent()  # the operator said "repeat"
+    assert q.put("ask", "Did you place it?", now=t0 + 1.0) is True
+    assert q.put("ask", "Did you place it?", now=t0 + 1.5, dedupe=False) is True
+    assert q.dropped_dedup == 0
+
+
 def test_full_queue_rejects_arrival_that_outranks_nothing_queued():
     q = VoiceQueue(maxsize=1)
     q.put("alert", "a1")
@@ -140,6 +159,42 @@ def test_alert_interrupts_a_prompt_that_is_playing():
         player.stop()
     assert backend.stop_calls >= 1
     assert backend.spoken == ["a very long prompt", "urgent alert"]
+
+
+def test_player_survives_a_backend_error_and_keeps_speaking():
+    class Flaky(FakeTTS):
+        def speak(self, text: str) -> None:
+            if text == "bad":
+                raise OSError("audio device busy")
+            super().speak(text)
+
+    backend = Flaky(speak_s=0.01)
+    q = VoiceQueue(dedup_s=0.0)
+    player = VoicePlayer(backend, q)
+    player.start()
+    try:
+        q.put("prompt", "bad")
+        q.put("prompt", "good")
+        _drain(q, timeout=5.0)
+        assert player.running
+    finally:
+        player.stop()
+    assert backend.spoken == ["good"]
+    assert player.errors == 1 and "audio device busy" in (player.last_error or "")
+
+
+def test_a_late_interrupt_never_stops_the_item_that_replaced_it():
+    backend = FakeTTS(speak_s=0.01)
+    q = VoiceQueue()
+    player = VoicePlayer(backend, q)
+    # Nothing is speaking, or something else is: an interrupt aimed at seq 7 is ignored.
+    player._on_interrupt(7)
+    assert backend.stop_calls == 0
+    player._speaking_seq = 8
+    player._on_interrupt(7)
+    assert backend.stop_calls == 0
+    player._on_interrupt(8)
+    assert backend.stop_calls == 1
 
 
 def test_burst_of_prompts_and_alerts_plays_quickly_and_speaks_every_alert():

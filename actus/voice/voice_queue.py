@@ -5,20 +5,24 @@ influence anything here — it only orders *already-decided* engine outputs (``A
 ``Prompt``) for speech, the same way a phone call takes priority over a notification.
 
 * **Dedup**: the same text enqueued again within ``dedup_s`` of the last time is dropped
-  silently (e.g. a re-published, unchanged ``Prompt`` while nothing has changed).
+  silently (e.g. a re-published, unchanged ``Prompt`` while nothing has changed). An operator
+  asking to hear it again ("repeat", "what's next", a "no" answer) is not a duplicate: the caller
+  calls ``forget_recent()`` first, or passes ``dedupe=False``.
 * **TTL**: each kind has its own time-to-live. An item still queued once its TTL has elapsed is
   dropped instead of spoken late.
 * **Capacity**: when full, the lowest-priority (and, among ties, oldest) queued item is evicted
   to make room for an arrival that outranks it; an arrival that outranks nothing queued is
   itself dropped.
 * **Interruption**: an item that outranks whatever is currently playing calls the queue's
-  registered interrupt hook (``VoicePlayer`` wires this to ``TTSBackend.stop``), so an alert cuts
-  off a prompt mid-sentence.
+  registered interrupt hook with the ``seq`` of the item it outranks. ``VoicePlayer`` stops the
+  backend only if that item is still the one being spoken, so a late interrupt never cuts off
+  the alert that replaced it.
 """
 
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 import threading
 import time
@@ -26,6 +30,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from actus.core.contracts import Alert, Ask, Prompt
+
+logger = logging.getLogger(__name__)
 
 _PRIORITY: dict[str, int] = {"alert": 0, "ask": 1, "prompt": 2, "info": 3}
 _POLL_S = 0.1  # cap on how long `get` waits between TTL re-checks
@@ -78,7 +84,7 @@ class VoiceQueue:
         self._seq = itertools.count()
         self._closed = False
         self._current: VoiceItem | None = None
-        self._interrupt: Callable[[], None] | None = None
+        self._interrupt: Callable[[int], None] | None = None
 
         self.dropped_dedup = 0
         self.dropped_full = 0
@@ -86,33 +92,48 @@ class VoiceQueue:
 
     # -- wiring ---------------------------------------------------------------------------------
 
-    def set_interrupt(self, fn: Callable[[], None] | None) -> None:
-        """``fn`` is called (outside the lock) when a new item outranks what's playing now."""
+    def set_interrupt(self, fn: Callable[[int], None] | None) -> None:
+        """``fn(seq)`` is called (outside the lock) when a new item outranks what's playing now;
+        ``seq`` identifies the item being outranked."""
         with self._cv:
             self._interrupt = fn
+
+    def forget_recent(self) -> None:
+        """Clear the dedup memory, so the next copy of any text is spoken again. Call it when the
+        operator asks for a repeat (a ``Command`` or an ``Answer``)."""
+        with self._cv:
+            self._recent.clear()
 
     # -- producer side ----------------------------------------------------------------------------
 
     def put(
-        self, kind: str, text: str, *, ref: object | None = None, now: float | None = None
+        self,
+        kind: str,
+        text: str,
+        *,
+        ref: object | None = None,
+        now: float | None = None,
+        dedupe: bool = True,
     ) -> bool:
         """Enqueue speech. Returns False if it was dropped (dedup / full / closed)."""
         if kind not in _PRIORITY:
             raise ValueError(f"unknown voice item kind {kind!r}")
         now = time.monotonic() if now is None else now
         interrupt = None
+        interrupted_seq = -1
         with self._cv:
             if self._closed:
                 return False
             self._evict_expired(now)
             last = self._recent.get(text)
-            if last is not None and now - last < self.dedup_s:
+            if dedupe and last is not None and now - last < self.dedup_s:
                 self.dropped_dedup += 1
                 return False
 
             item = VoiceItem(kind, text, now, self.ttl_s[kind], next(self._seq), ref)
             if len(self._items) >= self.maxsize:
-                worst = max(self._items, key=lambda it: (it.priority, it.seq))
+                # Lowest priority first; among ties the oldest (smallest seq) goes.
+                worst = max(self._items, key=lambda it: (it.priority, -it.seq))
                 if worst.priority > item.priority:
                     self._items.remove(worst)
                     self.dropped_full += 1
@@ -125,28 +146,31 @@ class VoiceQueue:
             self._items.sort(key=lambda it: (it.priority, it.seq))
             if self._current is not None and item.priority < self._current.priority:
                 interrupt = self._interrupt
+                interrupted_seq = self._current.seq
             self._cv.notify()
         if interrupt is not None:
-            interrupt()
+            interrupt(interrupted_seq)
         return True
 
-    def put_alert(self, alert: Alert, *, now: float | None = None) -> bool:
-        return self.put("alert", alert.message, ref=alert, now=now)
+    def put_alert(self, alert: Alert, *, now: float | None = None, dedupe: bool = True) -> bool:
+        return self.put("alert", alert.message, ref=alert, now=now, dedupe=dedupe)
 
-    def put_ask(self, ask: Ask, *, now: float | None = None) -> bool:
-        return self.put("ask", ask.text, ref=ask, now=now)
+    def put_ask(self, ask: Ask, *, now: float | None = None, dedupe: bool = True) -> bool:
+        return self.put("ask", ask.text, ref=ask, now=now, dedupe=dedupe)
 
-    def put_prompt(self, prompt: Prompt, *, now: float | None = None) -> bool:
-        return self.put("prompt", prompt.text, ref=prompt, now=now)
+    def put_prompt(self, prompt: Prompt, *, now: float | None = None, dedupe: bool = True) -> bool:
+        return self.put("prompt", prompt.text, ref=prompt, now=now, dedupe=dedupe)
 
-    def put_contract(self, payload: object, *, now: float | None = None) -> bool:
+    def put_contract(
+        self, payload: object, *, now: float | None = None, dedupe: bool = True
+    ) -> bool:
         """Route an ``Alert``/``Ask``/``Prompt`` onto the queue with the matching priority kind."""
         if isinstance(payload, Alert):
-            return self.put_alert(payload, now=now)
+            return self.put_alert(payload, now=now, dedupe=dedupe)
         if isinstance(payload, Ask):
-            return self.put_ask(payload, now=now)
+            return self.put_ask(payload, now=now, dedupe=dedupe)
         if isinstance(payload, Prompt):
-            return self.put_prompt(payload, now=now)
+            return self.put_prompt(payload, now=now, dedupe=dedupe)
         raise TypeError(f"cannot speak a {type(payload).__name__}")
 
     # -- consumer side ----------------------------------------------------------------------------
@@ -207,15 +231,35 @@ class VoicePlayer:
     """A single worker thread that drains a ``VoiceQueue`` through a ``TTSBackend``.
 
     Wires the queue's interrupt hook to ``backend.stop`` so a higher-priority arrival (an alert
-    while a prompt is playing) cuts the current utterance off immediately.
+    while a prompt is playing) cuts the current utterance off immediately. The stop only happens
+    if the outranked item is still the one being spoken.
+
+    A backend error on one utterance is logged and counted (``errors``, ``last_error``); the
+    worker keeps going, so one bad utterance or a busy audio device never silences the run.
+    ``speaking`` is true while an utterance is playing (the ASR gate mutes on it, so the
+    microphone never transcribes Actus's own voice).
     """
 
     def __init__(self, backend, vqueue: VoiceQueue) -> None:
         self.backend = backend
         self.queue = vqueue
-        self.queue.set_interrupt(backend.stop)
+        self._lock = threading.Lock()
+        self._speaking_seq: int | None = None
+        self.queue.set_interrupt(self._on_interrupt)
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
+        self.errors = 0
+        self.last_error: str | None = None
+
+    @property
+    def speaking(self) -> bool:
+        with self._lock:
+            return self._speaking_seq is not None
+
+    def _on_interrupt(self, seq: int) -> None:
+        with self._lock:
+            if self._speaking_seq is not None and self._speaking_seq == seq:
+                self.backend.stop()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -232,9 +276,17 @@ class VoicePlayer:
                 return
             if item is None:
                 continue
+            with self._lock:
+                self._speaking_seq = item.seq
             try:
                 self.backend.speak(item.text)
+            except Exception as exc:
+                self.errors += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("TTS failed on %r (%s); continuing", item.text, self.last_error)
             finally:
+                with self._lock:
+                    self._speaking_seq = None
                 self.queue.mark_done()
 
     def stop(self, *, wait: bool = True, timeout: float = 2.0) -> None:

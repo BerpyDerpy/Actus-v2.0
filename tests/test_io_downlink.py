@@ -107,6 +107,25 @@ def test_encode_downlink_trims_messages_then_raises_if_still_over_budget():
     assert len(data) <= 2000
     assert b"message" not in data
 
-    # still too big even after trimming
+    # still too big even with no alerts at all: the step table alone is over budget
     with pytest.raises(ValueError):
         encode_downlink(packet, max_bytes=50)
+
+
+def test_encode_downlink_keeps_the_latest_alerts_when_there_are_too_many():
+    import json
+
+    packet = {
+        "steps": [{"id": f"S{i}"} for i in range(6)],
+        "alerts": [
+            {"kind": "timeout" if i % 2 else "unexpected", "step_ids": ["S1"], "t": float(i)}
+            for i in range(200)
+        ],
+    }
+    data = encode_downlink(packet, max_bytes=1500)
+    assert len(data) <= 1500
+    out = json.loads(data)
+    assert out["alerts_total"] == 200
+    assert out["alerts_dropped"] == 200 - len(out["alerts"])
+    assert out["alert_counts"] == {"unexpected": 100, "timeout": 100}
+    assert out["alerts"][-1]["t"] == 199.0  # the most recent alerts are the ones kept

@@ -169,22 +169,30 @@ class LabelTrack:
     """Label changes keyed by frame index. The first row is always ``0, idle``."""
 
     rows: dict[int, tuple[float, str]] = field(default_factory=lambda: {0: (0.0, IDLE)})
-    history: list[int] = field(default_factory=list)
+    # (frame_idx, the row it replaced or None): undo restores exactly what one press changed,
+    # even when a frame was labelled twice or revisited in playback.
+    history: list[tuple[int, tuple[float, str] | None]] = field(default_factory=list)
 
     def set(self, frame_idx: int, t: float, label: str) -> None:
+        self.history.append((frame_idx, self.rows.get(frame_idx)))
         self.rows[frame_idx] = (t, label)
-        self.history.append(frame_idx)
 
     def undo(self) -> int | None:
-        while self.history:
-            fi = self.history.pop()
-            if fi in self.rows and fi not in self.history:
-                if fi == 0:
-                    self.rows[0] = (0.0, IDLE)
-                else:
-                    del self.rows[fi]
-                return fi
-        return None
+        if not self.history:
+            return None
+        fi, previous = self.history.pop()
+        if previous is not None:
+            self.rows[fi] = previous
+        elif fi == 0:
+            self.rows[0] = (0.0, IDLE)
+        else:
+            self.rows.pop(fi, None)
+        return fi
+
+    @property
+    def has_labels(self) -> bool:
+        """Any label besides the initial idle row."""
+        return any(lab != IDLE for _, _, lab in self.items())
 
     def label_at(self, frame_idx: int) -> str:
         keys = [k for k in self.rows if k <= frame_idx]
@@ -253,6 +261,12 @@ class CaptureThread(threading.Thread):
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.cap.set(cv2.CAP_PROP_FPS, fps)
+        # A file decodes as fast as the CPU allows; play it at its own rate instead, so the
+        # fixed-fps recorder and the marker check see it in real time, like a camera.
+        self._pace_fps: float | None = None
+        if isinstance(source, str) and "://" not in source and Path(source).is_file():
+            container_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            self._pace_fps = container_fps if container_fps and container_fps > 0 else fps
         self._lock = threading.Lock()
         self._latest: tuple[int, np.ndarray, float] | None = None
         self._stop = threading.Event()
@@ -262,7 +276,12 @@ class CaptureThread(threading.Thread):
 
     def run(self) -> None:
         seq = 0
+        start = time.monotonic()
         while not self._stop.is_set():
+            if self._pace_fps:
+                delay = start + seq / self._pace_fps - time.monotonic()
+                if delay > 0:
+                    self._stop.wait(delay)
             ok, frame = self.cap.read()
             t = time.monotonic()
             if not ok:
@@ -281,6 +300,11 @@ class CaptureThread(threading.Thread):
             return None
         seq, frame, t = latest
         return seq, rotate_frame(frame, self.rotation), t
+
+    def latest_seq(self) -> int | None:
+        """The newest frame's sequence number, without copying or rotating the frame."""
+        with self._lock:
+            return None if self._latest is None else self._latest[0]
 
     def rotate(self, *, step: int = 1) -> int:
         """Cycle the baked-in rotation by 90 deg x ``step`` (mod 360). Call only in standby,
@@ -332,6 +356,10 @@ class ReplayFrames(threading.Thread):
             return None
         seq, frame, t = latest
         return seq, rotate_frame(frame, self.rotation), t
+
+    def latest_seq(self) -> int | None:
+        with self._lock:
+            return None if self._latest is None else self._latest[0]
 
     def rotate(self, *, step: int = 1) -> int:
         """Cycle the baked-in rotation by 90 deg x ``step`` (mod 360). Call only in standby,
@@ -404,8 +432,9 @@ class CamRecorder:
         self.written = self.dups = self.cam_skipped = 0
 
     def has_new(self) -> bool:
-        latest = self.src.latest()
-        return latest is not None and latest[0] != self.last_seq
+        # Called in the tight grace-wait loop: read only the sequence number (no frame rotate).
+        seq = self.src.latest_seq()
+        return seq is not None and seq != self.last_seq
 
     def write(self, frame_idx: int, t_rel: float, t0: float) -> np.ndarray:
         seq, img, t_cap = self.src.latest()
@@ -499,6 +528,9 @@ def timeline_bar(view: np.ndarray, track: LabelTrack, pos: int, total: int) -> N
 # --------------------------------------------------------------------------------------------
 
 
+CHECK_READY_HEADLESS_S = 5.0
+
+
 def check_ready(args) -> int:
     """``--check-ready``: static setup checks plus a live marker check, before the video starts.
     Never records. Returns the process exit status (0 = ready, 1 = not)."""
@@ -530,12 +562,40 @@ def check_ready(args) -> int:
         print(f"FAIL  output directory not writable: {out_dir} ({e})")
         ok = False
 
-    free_gb = shutil.disk_usage(out_dir).free / 1e9
-    if free_gb < 1.0:
-        print(f"FAIL  only {free_gb:.2f} GB free on {out_dir}")
+    probe_dir = out_dir
+    while not probe_dir.exists() and probe_dir.parent != probe_dir:
+        probe_dir = probe_dir.parent  # the directory could not be created: measure its parent
+    try:
+        free_gb = shutil.disk_usage(probe_dir).free / 1e9
+    except OSError as e:
+        print(f"FAIL  cannot read free space for {out_dir} ({e})")
         ok = False
     else:
-        print(f"PASS  {free_gb:.1f} GB free on {out_dir}")
+        if free_gb < 1.0:
+            print(f"FAIL  only {free_gb:.2f} GB free on {out_dir}")
+            ok = False
+        else:
+            print(f"PASS  {free_gb:.1f} GB free on {out_dir}")
+
+    if args.source2:
+        # The live check below watches camera 1 only; at least make sure camera 2 opens and
+        # delivers a frame.
+        try:
+            cam2 = open_source(args.source2, args)
+            cam2.start()
+            deadline = time.monotonic() + args.warmup_timeout
+            while cam2.latest_seq() is None and not cam2.eof and time.monotonic() < deadline:
+                time.sleep(0.02)
+            got = cam2.latest_seq() is not None
+            cam2.stop()
+            if got:
+                print(f"PASS  second camera delivers frames: {args.source2}")
+            else:
+                print(f"FAIL  second camera gave no frames: {args.source2}")
+                ok = False
+        except (RuntimeError, OSError) as e:
+            print(f"FAIL  second camera did not open: {args.source2} ({e})")
+            ok = False
 
     print("-- live rig check (camera + ArUco markers) --")
     from tools.check_markers import main as marker_main
@@ -547,11 +607,19 @@ def check_ready(args) -> int:
         "--fps", str(args.fps),
         "--api", args.api,
     ]  # fmt: skip
+    duration = args.duration
+    if args.no_preview and not duration:
+        duration = CHECK_READY_HEADLESS_S  # no window to quit from: a headless gate must end
+        print(f"(headless: checking markers for {duration:g} s; set --duration to change)")
     if args.no_preview:
         marker_argv.append("--no-preview")
-    if args.duration:
-        marker_argv += ["--duration", str(args.duration)]
-    ok = marker_main(marker_argv) == 0 and ok
+    if duration:
+        marker_argv += ["--duration", str(duration)]
+    try:
+        ok = marker_main(marker_argv) == 0 and ok
+    except (RuntimeError, OSError, SystemExit) as e:
+        print(f"FAIL  camera check could not run: {e}")
+        ok = False
 
     print("READY to record" if ok else "NOT READY")
     return 0 if ok else 1
@@ -731,9 +799,11 @@ def record_take(
     stop_reason = "key"
     quit_requested = True
     stop_hint = "r to stop, q to stop and quit" if toggle else "q to stop"
+    simulated = any(s.describe().get("simulated") for s in sources)
+    sim_tag = " [SIMULATED]" if simulated else ""
     if monitor is not None:
         monitor.reset_stats()
-    print(f"recording {stem} at {args.fps:g} fps -> {out_dir}  ({stop_hint})")
+    print(f"recording {stem}{sim_tag} at {args.fps:g} fps -> {out_dir}  ({stop_hint})")
 
     try:
         while True:
@@ -803,6 +873,9 @@ def record_take(
         for cam in cams:
             cam.close()
     track.save(labels_path)
+    # Summarise the marker checks now: counting frames below can take a while, and in toggle
+    # mode the monitor keeps checking the live camera during it.
+    marker_summary = monitor.summary() if monitor is not None else None
 
     duration = (frame_idx + 1) / args.fps
     meta = {
@@ -825,7 +898,7 @@ def record_take(
         "labels_csv": labels_path.name,
         "label_rows": len(track.items()),
         "key_map": {"1-9": "S1-S9 start", "0": IDLE, "x": OTHER},
-        "simulated": any(s.describe().get("simulated") for s in sources),
+        "simulated": simulated,
         "cameras": [],
     }
     for cam in cams:
@@ -843,15 +916,15 @@ def record_take(
                   f"the camera delivers fewer than {args.fps:g} fps (lower --fps?)")  # fmt: skip
         if not info["frame_count_ok"]:
             print(f"WARNING {cam.video_path.name}: frame count mismatch {counts} vs {cam.written}")
-    if monitor is not None:
-        mk = meta["markers"] = monitor.summary()  # camera 1, checked live at ~monitor.hz
+    if marker_summary is not None:
+        mk = meta["markers"] = marker_summary  # camera 1, checked live at ~monitor.hz
         if mk["checks"] and mk["ready_frac"] < 0.5:
             print(f"WARNING markers: every rack marker visible in only {mk['ready_frac']:.0%} "
                   f"of checks; per marker {mk['seen_frac']}")  # fmt: skip
     meta_path = out_dir / f"{stem}.json"
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     ok = all(c["frame_count_ok"] for c in meta["cameras"])
-    print(f"saved {stem}: {frame_idx + 1} frames, {duration:.1f}s, "
+    print(f"saved {stem}{sim_tag}: {frame_idx + 1} frames, {duration:.1f}s, "
           f"{len(track.items())} label rows, frame count {'OK' if ok else 'MISMATCH'}")  # fmt: skip
     return meta_path, quit_requested
 
@@ -1129,8 +1202,15 @@ def label_video(
     meta.setdefault("mode", "playback_labelled")
     meta["labels_csv"] = labels_path.name
     meta["label_rows"] = len(track.items())
-    meta["labelled_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    meta["labelled_with"] = {"tool": "record_takes --label", "tool_version": TOOL_VERSION}
+    if track.has_labels:
+        meta["labelled_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        meta["labelled_with"] = {"tool": "record_takes --label", "tool_version": TOOL_VERSION}
+    else:
+        # Quit before pressing any step key (a break, the wrong file): still pending, so
+        # --label-pending offers it again and evaluate.py never scores an all-idle "truth".
+        meta.pop("labelled_at", None)
+        meta.pop("labelled_with", None)
+        print(f"no step labels entered for {video.name}; it stays pending")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"saved {labels_path.name}: {len(track.items())} label rows")
     return labels_path, esc
