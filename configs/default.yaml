@@ -119,4 +119,25 @@ ui:                              # T-UI (server.py)
   static_dir: ui/dist
   mjpeg_fallback: true
 
-faults: {}                       # T-FAULT
+faults:                          # T-FAULT (actus/app/faults.py)
+  enabled: false                 # attach the fault controller to live runs (or pass --faults)
+  hotkeys: true                  # console keys o d f x n, when stdin is a terminal
+  stale_frames: 3                # repeated identical frames before the stale-frame guard trips (0 = off)
+  schedule: []                   # e.g. ["occlude@9-12", "dim@f90-135:gamma=4"] (seconds, or f<frame>)
+  occlude: {region: [0.0, 0.0, 1.0, 1.0], max_covered: 0.5}   # region: x0,y0,x1,y1 as frame fractions
+  dim: {gamma: 3.0, min_conf: null}     # gamma > 1 is darker; min_conf null = detector.conf
+  freeze: {}
+  drop_detector: {}
+  kill_network: {}
+
+pipeline:                        # T-INT (actus/app/pipeline.py)
+  detector: config               # config (= detector.backend) | none | "package.module:factory"
+  handpose: config               # config (= perception.*) | none | "package.module:factory"
+  rack: aruco                    # aruco (measured rack.yaml) | selfcal (unmeasured rig) | factory
+  evidence: spatial              # spatial | replay (replay source only: its SIMULATED stand-in)
+  detector_every_n: 1            # run the detector on every Nth processed frame
+  handpose_every_n: 1
+  overlay: true                  # draw and publish the `annotated` stream
+  stats_interval_s: 1.0
+
+engine: {}                       # T-ENGINE DecisionParams overrides, e.g. vis_ask_after_s: 1.5

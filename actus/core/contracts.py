@@ -281,7 +281,9 @@ class HandSet:
 @dataclass(frozen=True, slots=True, eq=False)
 class PoseObs:
     landmarks_px: np.ndarray  # (33, 2) image pixels, in the ORIGINAL (un-rotated) image
-    world_landmarks: np.ndarray  # (33, 3) metres, MediaPipe hip-centred world coordinates
+    # (33, 3) metres, MediaPipe hip-centred world coordinates, as MediaPipe returned them: in the
+    # axes of the image it was run on, i.e. rotated by `rotation_used` (not rotated back).
+    world_landmarks: np.ndarray
     torso_vec_rack: np.ndarray | None  # (3,) unit vector hips→shoulders in rack coordinates
     conf: float
     rotation_used: int  # rotation TTA winner, degrees CCW
@@ -328,7 +330,7 @@ class RackFrame:
     rvec: np.ndarray | None  # (3,) Rodrigues, rack → camera
     tvec: np.ndarray | None  # (3,) metres, rack → camera
     markers_seen: tuple[int, ...]
-    reproj_err: float | None  # pixels RMS
+    reproj_err: float | None  # pixels, RMS of the image->rack plane fit (what gates `valid`)
     frame_idx: int = field(kw_only=True)
     t: float = field(kw_only=True)
     age_frames: int = field(default=0, kw_only=True)

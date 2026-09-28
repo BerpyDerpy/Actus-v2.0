@@ -1,0 +1,74 @@
+# T-EVAL success criteria, pre-registered.
+#
+# Written 2026-09-28, before any held-out number existed. The build plan requires the targets to
+# be fixed before the first real result, so that nobody can move them to fit the numbers.
+#
+# Rules for changing this file:
+#   * Do not edit a target after the first held-out run (tools/evaluate.py records this file's
+#     SHA-256 in every report, so an edit will show).
+#   * To change a target, bump `version`, set a new `frozen_on`, add a line to `changelog`
+#     explaining why, and re-run. The pitch quotes the version its numbers were judged against.
+#
+# The metric definitions are in tools/evaluate.py (DEFINITIONS) and in every report.md.
+
+version: 1
+frozen_on: 2026-09-28
+changelog:
+  - "v1 2026-09-28: first version, written before any held-out take was evaluated."
+
+# Scoring parameters. These belong to the definitions, so they are pre-registered too.
+parameters:
+  completion_tol_s: 2.0        # a completion matches an annotated step if the ends are within ±2 s (build plan)
+  alert_tol_s: 5.0             # an alert matches an annotated incident if within ±5 s (dwell + annotation slop)
+  answer_delay_s: 1.0          # the simulated operator answers an Ask 1 s after it is asked
+  answer_policy: oracle        # oracle | yes | no | none (see tools/evaluate.py)
+
+# Which takes are scored against the protocol under evaluation.
+takes:
+  split: test                  # data/splits/report.json: the operators held out of training
+  exclude_scenarios:
+    - secondary                # Task B takes follow a different protocol (sample_mixing.yaml)
+
+# Targets. `op` is how the value must compare with `target` to pass. A metric with no data
+# (e.g. no skip takes were filmed) reports n/a, which is not a pass.
+criteria:
+  - metric: step_completion_precision
+    op: ">="
+    target: 0.90
+    why: "A verified step that did not happen is the worst failure; keep it rare."
+  - metric: step_completion_recall
+    op: ">="
+    target: 0.80
+    why: "Most performed steps are confirmed by evidence; the rest should fall to an Ask, not be lost."
+  - metric: skip_alert_precision
+    op: ">="
+    target: 0.80
+    why: "A false skip accusation erodes operator trust quickly."
+  - metric: skip_alert_recall
+    op: ">="
+    target: 0.80
+    why: "Catching skips is the core deliverable."
+  - metric: out_of_order_alert_precision
+    op: ">="
+    target: 0.80
+    why: "Same reasoning as skips."
+  - metric: out_of_order_alert_recall
+    op: ">="
+    target: 0.80
+    why: "Same reasoning as skips."
+  - metric: false_alerts_per_min_correct_takes
+    op: "<="
+    target: 0.5
+    why: "At most one false alert every two minutes on a correctly performed procedure."
+  - metric: median_detection_latency_s
+    op: "<="
+    target: 2.0
+    why: "The checklist should tick within two seconds of the annotated end of the step."
+  - metric: ask_rate_per_min
+    op: "<="
+    target: 1.0
+    why: "Asking is the safe fallback, but more than one question a minute is nagging."
+  - metric: ask_then_correct_rate
+    op: ">="
+    target: 0.90
+    why: "When the system asks, the step should end with the right outcome."

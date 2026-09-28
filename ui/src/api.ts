@@ -1,4 +1,11 @@
-import type { BusStats, ProtocolSummary, RackConfig, ReportSummary, ScenarioInfo } from "./types";
+import type {
+  BusStats,
+  FaultsState,
+  ProtocolSummary,
+  RackConfig,
+  ReportSummary,
+  ScenarioInfo,
+} from "./types";
 
 async function getJson<T>(path: string): Promise<T> {
   const resp = await fetch(path);
@@ -26,6 +33,22 @@ export const api = {
   },
   async demoStop(): Promise<boolean> {
     const resp = await fetch("/api/demo/stop", { method: "POST" });
+    return resp.ok;
+  },
+
+  // 404 (or a network error) when the pipeline runs without fault injection: no controls shown.
+  async faults(): Promise<FaultsState | null> {
+    try {
+      const resp = await fetch("/api/faults");
+      if (!resp.ok) return null;
+      return (await resp.json()) as FaultsState;
+    } catch {
+      return null;
+    }
+  },
+  async setFault(name: string, on?: boolean): Promise<boolean> {
+    const query = on === undefined ? "" : `?on=${on}`;
+    const resp = await fetch(`/api/faults/${encodeURIComponent(name)}${query}`, { method: "POST" });
     return resp.ok;
   },
 };

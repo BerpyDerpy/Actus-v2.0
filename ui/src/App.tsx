@@ -5,6 +5,7 @@ import { AskCard } from "./components/AskCard";
 import { Checklist } from "./components/Checklist";
 import { DemoControls } from "./components/DemoControls";
 import { EventLogTail } from "./components/EventLogTail";
+import { FaultBanner, FaultControls } from "./components/FaultControls";
 import { LivePane } from "./components/LivePane";
 import { NextStepCard } from "./components/NextStepCard";
 import { RackMiniMap } from "./components/RackMiniMap";
@@ -42,6 +43,8 @@ export function App() {
         </span>
         <span className="protocol-title">{protocol?.available ? protocol.title : "…"}</span>
         <DemoControls />
+        <FaultBanner stats={state.stats} />
+        <FaultControls stats={state.stats} />
         <span>
           <span className={`conn-dot ${state.connected ? "on" : "off"}`} />
           {state.connected ? "connected" : "disconnected"}

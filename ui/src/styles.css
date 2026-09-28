@@ -543,3 +543,63 @@ body {
   border: 1px dashed var(--border);
   border-radius: 8px;
 }
+
+/* -- fault injection ------------------------------------------------------------------------- */
+
+.fault-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.fault-label {
+  color: var(--text-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.fault-btn {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.fault-btn kbd {
+  font-family: var(--mono);
+  color: var(--text-dim);
+}
+.fault-btn:hover {
+  border-color: var(--danger);
+}
+.fault-btn.on {
+  background: var(--danger-dim);
+  border-color: var(--danger);
+  color: #ffd6da;
+}
+.fault-banner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--danger-dim);
+  border: 1px solid var(--danger);
+  color: #ffd6da;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  animation: fault-pulse 1.2s ease-in-out infinite;
+}
+.fault-tag {
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+}
+.fault-tag.detected {
+  color: var(--warn);
+}
+@keyframes fault-pulse {
+  50% {
+    box-shadow: 0 0 10px var(--danger);
+  }
+}

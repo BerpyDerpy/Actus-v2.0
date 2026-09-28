@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +39,12 @@ GENESIS_HASH = "0" * 64
 
 def _iso_now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def iso_at(posix_s: float) -> str:
+    """ISO-8601 UTC timestamp (millisecond precision) for POSIX seconds."""
+    dt = datetime.fromtimestamp(posix_s, UTC)
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _canonical(record: dict[str, Any]) -> str:
@@ -92,6 +99,10 @@ class EventLog:
     log. Signal handlers can only be installed from the main thread; construct with
     ``catch_signals=False`` from a worker thread or in tests and rely on ``atexit`` /an explicit
     ``close()``.
+
+    ``clock`` (optional) returns POSIX seconds and replaces the wall clock for ``ts``,
+    ``started_at`` and ``duration_s``. ``tools/run_offline.py`` passes one derived from the
+    pipeline's frame clock, so re-running the same input yields a byte-identical log.
     """
 
     def __init__(
@@ -101,22 +112,30 @@ class EventLog:
         events_file: str = "events.jsonl",
         schema_version: int = SCHEMA_VERSION,
         catch_signals: bool = True,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.run_dir / events_file
         self.schema_version = schema_version
+        self._clock = clock
         self._lock = threading.Lock()
         self._seq, self._prev_hash = self._resume()
         self._counts: Counter[str] = Counter()
         self._closed = False
         self._final_hash: str | None = None
-        self._started_at = _iso_now()
-        self._start_perf = time.monotonic()
+        self._started_at = self._now_iso()
+        self._start_perf = self._elapsed_base()
         self._prev_handlers: dict[int, Any] = {}
         if catch_signals:
             self._install_signal_handlers()
         atexit.register(self._atexit_close)
+
+    def _now_iso(self) -> str:
+        return _iso_now() if self._clock is None else iso_at(self._clock())
+
+    def _elapsed_base(self) -> float:
+        return time.monotonic() if self._clock is None else self._clock()
 
     def _resume(self) -> tuple[int, str]:
         """Continue an existing log's chain (e.g. a run resumed after a crash) instead of
@@ -160,7 +179,7 @@ class EventLog:
             record = {
                 "schema_version": self.schema_version,
                 "seq": self._seq,
-                "ts": _iso_now(),
+                "ts": self._now_iso(),
                 **body,
                 "prev_hash": self._prev_hash,
             }
@@ -181,11 +200,11 @@ class EventLog:
             summary = {
                 "schema_version": self.schema_version,
                 "seq": self._seq,
-                "ts": _iso_now(),
+                "ts": self._now_iso(),
                 "type": "run_end",
                 "reason": reason,
                 "started_at": self._started_at,
-                "duration_s": time.monotonic() - self._start_perf,
+                "duration_s": self._elapsed_base() - self._start_perf,
                 "event_counts": dict(self._counts),
                 "prev_hash": self._prev_hash,
             }

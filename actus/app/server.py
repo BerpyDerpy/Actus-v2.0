@@ -86,13 +86,16 @@ def create_app(
     config: Config | None = None,
     protocol: Protocol | None = None,
     enable_demo: bool = True,
+    faults: Any = None,
 ) -> FastAPI:
     """Build the FastAPI app around an already-running ``bus``.
 
     ``protocol`` defaults to loading ``config.protocol.path``; pass it explicitly to avoid a
     second parse when the caller already has one loaded. ``enable_demo`` mounts ``/api/demo/*``,
     which feeds :mod:`actus.capture.replay` scenarios onto ``bus`` on request — leave it True for
-    a standalone dashboard, and set it False once a real pipeline owns ``bus``.
+    a standalone dashboard, and set it False once a real pipeline owns ``bus``. ``faults`` is the
+    pipeline's ``actus.app.faults.FaultController``; with it the dashboard gets ``/api/faults``
+    (state, and switches for each injected fault).
     """
     from fastapi import FastAPI, WebSocketDisconnect
     from fastapi.responses import JSONResponse, StreamingResponse
@@ -141,6 +144,11 @@ def create_app(
 
     if enable_demo:
         _mount_demo_routes(app, bus, config, protocol)
+
+    if faults is not None:
+        from actus.app.faults import mount_fault_routes
+
+        mount_fault_routes(app, faults)
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
@@ -347,10 +355,17 @@ async def _mjpeg_frames(bus: Bus):
     from starlette.concurrency import run_in_threadpool
 
     sub = bus.subscribe(FRAME_TOPICS, maxsize=2, policy="drop_oldest", name="ui-mjpeg")
+    seen_annotated = False
     try:
         while True:
             env = await run_in_threadpool(sub.get, 1.0)
             if env is None:
+                continue
+            # Raw frames are only the fallback: once a pipeline publishes annotated frames,
+            # interleaving the two would make the feed flicker between them.
+            if env.topic is Topic.ANNOTATED:
+                seen_annotated = True
+            elif seen_annotated:
                 continue
             packet = env.payload
             ok, buf = cv2.imencode(".jpg", packet.image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])

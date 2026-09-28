@@ -220,3 +220,25 @@ export interface BusStats {
   }>;
   dropped_total: number;
 }
+
+// -- fault injection (T-FAULT; GET /api/faults, 404 unless the pipeline runs with faults on) ------
+
+export interface FaultInfo {
+  name: string;
+  label: string;
+  key: string;
+  summary: string;
+  expected: string;
+  active: boolean;
+  refused: string | null;
+}
+
+export interface FaultsState {
+  available: boolean;
+  simulated: boolean;
+  faults: FaultInfo[];
+  active: string[];
+  detected: string[];
+  network: { state: string; error: string | null };
+  guard: { enabled: boolean; stale_after: number | null };
+}
