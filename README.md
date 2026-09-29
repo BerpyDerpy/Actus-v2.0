@@ -9,8 +9,7 @@ step. Video is pushed over RTSP to a configurable IP and recorded locally. SIH 2
 
 The design rule: **models are sensors, the protocol engine is the judge.** Detectors, pose and
 the trained models emit evidence with confidences; only `actus/protocol/` decides that a step
-happened. Read [build-plan.md](build-plan.md) for the architecture and [CLAUDE.md](CLAUDE.md)
-for the rules the code follows.
+happened.
 
 > **Status.** The pipeline harness is complete and runs end to end on the SIMULATED replay. The
 > trained detector, HOI and temporal models are not plugged in yet, and nothing in this README's
@@ -140,7 +139,7 @@ After an offline install, `scripts/run.*` set `UV_OFFLINE` and `UV_NO_SYNC` (fro
 
 Site overrides go in a YAML passed with `--config`, or as `--override key.path=value`. Unknown
 keys are errors (`actus/core/config.py`). Swapping any pipeline stage for a better model needs no
-pipeline change; see `Vault/T-INT.md` section 3.
+pipeline change.
 
 ## Tools
 
@@ -162,11 +161,11 @@ This is the honest table. Fill in a row when someone measures it; do not round u
 
 | Machine | Role | Setup path verified | Live FPS (detector + hands + pose) | Notes |
 |---|---|---|---|---|
-| Windows 11 laptop (current dev machine) | development | unit tests written, not yet run for the packaging lane | not measured | The pipeline harness alone costs about 7.5 ms per frame on the replay (no neural stages), per `Vault/T-INT.md`. |
-| Apple M2 MacBook | target demo machine | not verified | not measured | The plan's bar is at least 15 FPS live with voice, GUI, RTSP and recording. ultralytics chooses its own device; MediaPipe runs on CPU here. |
-| Laptop with an RTX 4070 | detector training | not verified | not applicable | The plan says YOLO11n also trains acceptably on the M2 (MPS). |
+| Windows 11 laptop (current dev machine) | development | unit tests written, packaging tests not yet run | not measured | The pipeline harness alone costs about 7.5 ms per frame on the replay (no neural stages). |
+| Apple M2 MacBook | target demo machine | not verified | not measured | Target is at least 15 FPS live with voice, GUI, RTSP and recording. ultralytics chooses its own device; MediaPipe runs on CPU here. |
+| Laptop with an RTX 4070 | detector training | not verified | not applicable | YOLO11n is also expected to train acceptably on the M2 (MPS). |
 | Ubuntu x86-64 | CI | the workflow is disabled (`.github/workflows/ci.yml.disabled`) | not applicable | Runs ruff and pytest when enabled. |
-| NVIDIA Jetson Orin | finale (F-EDGE) | not built | not measured | ONNX/TensorRT export is a finale task. |
+| NVIDIA Jetson Orin | future work | not built | not measured | ONNX/TensorRT export for edge deployment. |
 
 To measure a row:
 
@@ -176,8 +175,8 @@ bash scripts/run.sh --live                                     # then read the G
 ```
 
 Run the test suite with `uv run pytest`, and lint with `uv run ruff check . && uv run ruff format
---check .`. The packaging lane's tests are `tests/test_pkg_*.py`; they use local files and a
-folder standing in for the internet, never the network.
+--check .`. The packaging tests are `tests/test_pkg_*.py`; they use local files and a folder
+standing in for the internet, never the network.
 
 
 ## Licences
@@ -196,7 +195,7 @@ ACTUS depends on:
 
 Ultralytics' AGPL-3.0 carries obligations when the software is distributed or offered over a
 network; check them before publishing or handing the code on. SMPL, which is non-commercial,
-matters only if the finale's mesh-recovery spike ships; it is not used today.
+would only matter if a future mesh-recovery feature ships; it is not used today.
 
 ## Repository layout
 
@@ -210,10 +209,10 @@ ui/                React dashboard (built to ui/dist)
 protocols/         bas_boxes, sample_mixing        configs/          default, rack, assets (+ overlays)
 tools/             recording, dataset, training, evaluation, packaging
 scripts/           setup.sh|ps1, run.sh|ps1, run_demo.sh, setup_media.sh
-Vault/             per-lane decision notes          tests/            pytest suite
+tests/             pytest suite
 data/ models/ runs/ bin/ dist/ wheels/               gitignored
 ```
 
-`scripts/setup_media.sh` (from the IO lane) is the older, standalone way to fetch MediaMTX and
-FFmpeg. `tools/fetch_models.py` does the same for every platform, including Windows, and also
-pins and verifies; prefer it.
+`scripts/setup_media.sh` is the older, standalone way to fetch MediaMTX and FFmpeg.
+`tools/fetch_models.py` does the same for every platform, including Windows, and also pins and
+verifies; prefer it.
