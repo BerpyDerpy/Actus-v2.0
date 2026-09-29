@@ -179,29 +179,6 @@ Run the test suite with `uv run pytest`, and lint with `uv run ruff check . && u
 --check .`. The packaging lane's tests are `tests/test_pkg_*.py`; they use local files and a
 folder standing in for the internet, never the network.
 
-## Limitations
-
-Copied from the plan's honesty list, plus what the current state adds. They go on the slide as
-they are.
-
-- The step logic is a protocol state machine over trained perception. The HAR model provides
-  evidence and does not decide alone.
-- The dataset is small: a handful of operators, about an hour of footage, filmed on Earth. Numbers
-  are on **held-out operators**, not held-out environments.
-- The rotated-camera test emulates a lack of a fixed "up"; it is not microgravity footage.
-- The orientation-agnostic claim covers the rack frame, rotation augmentation and rotation
-  test-time augmentation. It is not full 3D human mesh recovery.
-- The sample-experiment steps are our reading of a truncated official description
-  (`protocols/bas_boxes.yaml`).
-- Throughput is measured on the machines in the table above, not on flight hardware.
-- Until the custom detector is trained and the rack is measured, real footage cannot be judged:
-  the open-vocabulary detector does not find the red box reliably and the placeholder rack
-  geometry gives no valid frame (`Vault/T-HOI-TEMP.md`, `Vault/T-INT.md`). The harness runs; the
-  steps stay pending.
-- YOLO-World needs OpenAI's CLIP text encoder and the `clip` Python package, which installs from
-  git. `setup` fetches both, but the package is not in `uv.lock`, so a later plain `uv sync`
-  removes it; re-run `setup` (or `tools/fetch_models.py --warm`). Moving it into the
-  `perception` extra is a proposed follow-up (`Vault/T-PKG.md`).
 
 ## Licences
 
